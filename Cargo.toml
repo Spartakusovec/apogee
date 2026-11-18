@@ -5,8 +5,8 @@ license = "MIT"
 edition = "2021"
 description = "A desktop shell for Sway: bar, dock, Spotlight, popups, notifications and a Settings app"
 
-# malý klient bez GTK (spouští se při každém kliknutí a drží moduly panelu)
-# a démon s GTK, který dělá všechno ostatní
+# a small client without GTK (runs on every click and keeps the bar modules)
+# and the daemon with GTK that does everything else
 [[bin]]
 name = "apogee"
 path = "src/client.rs"
