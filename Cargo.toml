@@ -9,7 +9,7 @@ description = "A desktop shell for Sway: bar, dock, Spotlight, popups, notificat
 # a démon s GTK, který dělá všechno ostatní
 [[bin]]
 name = "apogee"
-path = "src/klient.rs"
+path = "src/client.rs"
 
 [[bin]]
 name = "apogee-daemon"

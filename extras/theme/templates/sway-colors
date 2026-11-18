@@ -1,0 +1,16 @@
+# Generated from ~/.config/theme/templates/sway-colors by set-wallpaper – don't edit by hand
+set $$base     ${base}
+set $$mantle   ${mantle}
+set $$surface  ${surface}
+set $$overlay  ${overlay}
+set $$text     ${text}
+set $$accent   ${accent}
+set $$urgent   ${red}
+
+output * bg ${wallpaper} fill
+
+#                       border    background text    indicator  child border
+client.focused          ${accent} ${accent} ${base}  ${accent}  ${accent}
+client.focused_inactive ${surface} ${surface} ${text} ${surface} ${surface}
+client.unfocused        ${mantle} ${mantle} ${dim}   ${mantle}  ${mantle}
+client.urgent           ${red} ${red} ${base}  ${red}  ${red}

@@ -1,32 +1,32 @@
 #!/bin/bash
-# Kouřový test apogeeu v úplně odděleném prostředí: vlastní Sway bez obrazovky (headless),
-# vlastní XDG_RUNTIME_DIR (sokety Swaye, Waylandu i apogeeu jen tam), vlastní sběrnice sezení
-# a kopie nastavení v dočasném HOME. Skutečného sezení se nedotkne.
+# Smoke test of Apogee in a fully separate environment: its own headless Sway, its own
+# XDG_RUNTIME_DIR (the Sway, Wayland and Apogee sockets live only there), its own session bus
+# and a copy of the config in a temporary HOME. The real session is never touched.
 #
 #   bash tests/smoke.sh            – sestavit (cargo build --release) a otestovat
-#   bash tests/smoke.sh --no-build – otestovat už sestavený target/release/apogee-daemon
-#   SWAY=/cesta/k/sway bash tests/smoke.sh – s jiným Swayem (třeba čistým z Fedory, bez úpravy)
-#   MEASURE_RUNS=20 bash tests/smoke.sh --no-build – navíc změřit rychlost otevření okének (20 pokusů na okénko)
+#   bash tests/smoke.sh --no-build – test the existing build in target/release
+#   SWAY=/path/to/sway bash tests/smoke.sh – with another Sway (e.g. plain Fedora Sway, without the patch)
+#   MEASURE_RUNS=20 bash tests/smoke.sh --no-build – also measure how fast popups open (20 runs each)
 #
-# Co ověří: démon naběhne a odpovídá; všechny stránky Settings se otevřou; okénka z panelu
-# se otevřou (i klikem pod modulem); dialog hesla k Wi-Fi vrátí NetworkManageru jméno a heslo;
-# v logu chyb není pád. Snímky obrazovky uloží do tests/out/ (není v gitu, nezálohuje se).
+# What it checks: the daemon starts and answers; every Settings page opens; the bar popups
+# open (also by clicking under a module); the Wi-Fi password dialog returns the password to
+# NetworkManager; no crash in the error log. Screenshots go to tests/out/ (not in git).
 set -uo pipefail
-ZDROJ=$(cd "$(dirname "$0")/.." && pwd)
-OUT=$ZDROJ/tests/out
-DEMON=$ZDROJ/target/release/apogee-daemon
+SRC=$(cd "$(dirname "$0")/.." && pwd)
+OUT=$SRC/tests/out
+DAEMON=$SRC/target/release/apogee-daemon
 SWAY=${SWAY:-sway}
-chyb=0
+failures=0
 ok() { echo "  ok    $1"; }
-chyba() { echo "  CHYBA $1"; chyb=$((chyb + 1)); }
+fail() { echo "  FAIL $1"; failures=$((chyb + 1)); }
 
 if [ "${1:-}" != "--no-build" ]; then
     echo "== Build"
-    (cd "$ZDROJ" && cargo build --release 2>&1 | grep -E "^(warning|error)" -A5) && true
+    (cd "$SRC" && cargo build --release 2>&1 | grep -E "^(warning|error)" -A5) && true
 fi
-[ -x "$DEMON" ] || { echo "Missing $DEMON"; exit 1; }
+[ -x "$DAEMON" ] || { echo "Missing $DAEMON"; exit 1; }
 
-# --- oddělené prostředí ---
+# --- separate environment ---
 T=$(mktemp -d /tmp/apogee-test.XXXXXX)
 RT=$T/run; H=$T/home
 mkdir -p "$RT" "$H/.config" "$H/.cache" "$OUT"; chmod 700 "$RT"
@@ -36,7 +36,7 @@ for d in apogee sway theme gtklock fuzzel dconf; do
 done
 mkdir -p "$H/Pictures"; cp -r ~/Pictures/Wallpapers "$H/Pictures/" 2>/dev/null
 ln -s ~/.local "$H/.local"
-# žádné aplikace po startu (značka „už proběhlo“)
+# no apps at login (the “already done” marker)
 touch "$RT/apogee-autostart-done"
 
 cat > "$T/sway.conf" <<EOF
@@ -49,16 +49,16 @@ for_window [app_id=".*"] floating enable
 output * mode --custom 1920x1080
 EOF
 
-# nástroje: virtuální myš a klávesnice (protokoly wlroots)
+# tools: virtual pointer and keyboard (wlroots protocols)
 for n in pointer keyboard; do
-    wayland-scanner client-header "$ZDROJ/tests/tools/virtual-$n.xml" "$T/virtual-$n.h"
-    wayland-scanner private-code "$ZDROJ/tests/tools/virtual-$n.xml" "$T/virtual-$n.c"
+    wayland-scanner client-header "$SRC/tests/tools/virtual-$n.xml" "$T/virtual-$n.h"
+    wayland-scanner private-code "$SRC/tests/tools/virtual-$n.xml" "$T/virtual-$n.c"
 done
-gcc -I"$T" -o "$T/vmys" "$ZDROJ/tests/tools/vmys.c" "$T/virtual-pointer.c" -lwayland-client || exit 1
-gcc -I"$T" -o "$T/vklav" "$ZDROJ/tests/tools/vklav.c" "$T/virtual-keyboard.c" -lwayland-client -lxkbcommon || exit 1
+gcc -I"$T" -o "$T/vpointer" "$SRC/tests/tools/vpointer.c" "$T/virtual-pointer.c" -lwayland-client || exit 1
+gcc -I"$T" -o "$T/vkeyboard" "$SRC/tests/tools/vkeyboard.c" "$T/virtual-keyboard.c" -lwayland-client -lxkbcommon || exit 1
 
-# vše další běží uvnitř vlastní sběrnice sezení (dbus-run-session) s vlastním XDG_RUNTIME_DIR
-cat > "$T/uvnitr.sh" <<'UVNITR'
+# everything else runs inside its own session bus (dbus-run-session) with its own XDG_RUNTIME_DIR
+cat > "$T/inside.sh" <<'UVNITR'
 set -uo pipefail
 cd "$T"
 env -u SWAYSOCK -u WAYLAND_DISPLAY -u DISPLAY XDG_RUNTIME_DIR="$RT" HOME="$H" \
@@ -69,34 +69,37 @@ for _ in $(seq 50); do ls "$RT"/sway-ipc.*.sock >/dev/null 2>&1 && break; sleep 
 export XDG_RUNTIME_DIR=$RT HOME=$H
 export SWAYSOCK=$(ls "$RT"/sway-ipc.*.sock 2>/dev/null | head -1)
 export WAYLAND_DISPLAY=$(ls "$RT" | grep -E '^wayland-[0-9]+$' | head -1)
-[ -n "$SWAYSOCK" ] && [ -n "$WAYLAND_DISPLAY" ] || { echo "  CHYBA test Sway did not start"; tail -5 "$T/sway.log"; exit 1; }
+[ -n "$SWAYSOCK" ] && [ -n "$WAYLAND_DISPLAY" ] || { echo "  FAIL test Sway did not start"; tail -5 "$T/sway.log"; exit 1; }
 unset DISPLAY
 
-APOGEE_AGENT_TEST=1 "$DEMON" > "$T/apogee.log" 2>&1 &
+APOGEE_AGENT_TEST=1 "$DAEMON" > "$T/apogee.log" 2>&1 &
 HPID=$!
 for _ in $(seq 100); do [ -S "$RT/apogee.sock" ] && break; sleep 0.1; done
-poslat() { python3 -I -c "import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.send((' '.join(sys.argv[2:])+'\n').encode())" "$RT/apogee.sock" "$@"; }
-snimek() { timeout 10 grim ${2:+-g "$2"} "$OUT/$1.png" 2>/dev/null; }
-okno() { swaymsg -t get_tree | grep -q "\"app_id\": \"$1\""; }
-if [ -S "$RT/apogee.sock" ]; then echo "  ok    daemon started"; else echo "  CHYBA daemon did not start"; exit 1; fi
+send() { python3 -I -c "import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.send((' '.join(sys.argv[2:])+'\n').encode())" "$RT/apogee.sock" "$@"; }
+shot() { timeout 10 grim ${2:+-g "$2"} "$OUT/$1.png" 2>/dev/null; }
+has_window() { swaymsg -t get_tree | grep -q "\"app_id\": \"$1\""; }
+if [ -S "$RT/apogee.sock" ]; then echo "  ok    daemon started"; else echo "  FAIL daemon did not start"; exit 1; fi
 sleep 4
-snimek panel "0,0 1920x50"
+shot panel "0,0 1920x50"
+python3 -I -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get('format')==2 and not set(d)&{'dok','hodiny','poloha','panel_skryte','rozlozeni'} else 1)" "$H/.config/apogee/settings.json" \
+    && echo "  ok    settings.json in the current format" || echo "  FAIL settings.json was not migrated"
+cp "$H/.config/apogee/settings.json" "$OUT/settings-after-migration.json" 2>/dev/null
 
 echo "== Settings pages"
 for s in wifi network bluetooth sound display keyboard power appearance panel windows notifications shortcuts apps time users storage updates about; do
-    poslat settings "$s"; sleep 1.5
-    if okno apogee-settings; then echo "  ok    settings $s"; else echo "  CHYBA settings $s: no window"; fi
-    snimek "settings-$s"
+    send settings "$s"; sleep 1.5
+    if has_window apogee-settings; then echo "  ok    settings $s"; else echo "  FAIL settings $s: no window"; fi
+    shot "settings-$s"
 done
 swaymsg '[app_id=apogee-settings] kill' >/dev/null; sleep 1
 
 echo "== Popups"
 for p in calendar weather sound brightness wifi bluetooth battery notifications updates power wallpapers; do
-    poslat "$p"; sleep 1.2; snimek "popup-$p"; poslat "$p"; sleep 0.4
+    send "$p"; sleep 1.2; shot "popup-$p"; send "$p"; sleep 0.4
 done
 echo "  ok    popups opened (see tests/out/popup-*.png)"
-# klik na hodiny: kalendář pod nimi
-"$T/vmys" 960 24 klik; sleep 1.5; snimek popup-click-clock "460,0 1000x600"; "$T/vmys" 960 24 klik; sleep 0.5
+# click on the clock: the calendar under it
+"$T/vpointer" 960 24 click; sleep 1.5; shot popup-click-clock "460,0 1000x600"; "$T/vpointer" 960 24 click; sleep 0.5
 echo "  ok    click on the clock (tests/out/popup-click-clock.png)"
 
 echo "== Wi-Fi password dialog"
@@ -104,20 +107,20 @@ AGENT=$(gdbus call --session --dest org.freedesktop.DBus --object-path /org/free
     | grep -o "':1\.[0-9]*'" | tr -d "'" | while read -r n; do
         gdbus introspect --session --dest "$n" --object-path /org/freedesktop/NetworkManager/SecretAgent 2>/dev/null | grep -q GetSecrets && echo "$n"
     done | head -1)
-snimek bez-dialogu
+shot no-dialog
 gdbus call --session --dest "$AGENT" --object-path /org/freedesktop/NetworkManager/SecretAgent \
     --method org.freedesktop.NetworkManager.SecretAgent.GetSecrets \
     "{'connection': {'id': <'Test network'>, 'type': <'802-11-wireless'>}}" /org/freedesktop/NetworkManager/Settings/1 \
-    802-11-wireless-security "[]" 1 --timeout 20 > "$T/odpoved.txt" 2>&1 &
-sleep 2; snimek wifi-password
-"$T/vklav" testpassword enter; sleep 1.5
-if grep -q "'psk': <'testpassword'>" "$T/odpoved.txt"; then echo "  ok    password returned to NetworkManager"; else echo "  CHYBA password dialog: $(cat "$T/odpoved.txt")"; fi
-# dialog má být uprostřed obrazovky (ne pod naposledy kliknutým modulem panelu)
-python3 -I - "$OUT/bez-dialogu.png" "$OUT/wifi-password.png" <<'PY' && echo "  ok    dialog in the middle of the screen" || echo "  CHYBA dialog is not in the middle (tests/out/wifi-password.png)"
+    802-11-wireless-security "[]" 1 --timeout 20 > "$T/reply.txt" 2>&1 &
+sleep 2; shot wifi-password
+"$T/vkeyboard" testpassword enter; sleep 1.5
+if grep -q "'psk': <'testpassword'>" "$T/reply.txt"; then echo "  ok    password returned to NetworkManager"; else echo "  FAIL password dialog: $(cat "$T/reply.txt")"; fi
+# the dialog must be in the middle of the screen (not under the last clicked bar module)
+python3 -I - "$OUT/no-dialog.png" "$OUT/wifi-password.png" <<'PY' && echo "  ok    dialog in the middle of the screen" || echo "  FAIL dialog is not in the middle (tests/out/wifi-password.png)"
 import sys
 from PIL import Image, ImageChops
 a, b = (Image.open(f).convert("L") for f in sys.argv[1:3])
-# kde se obraz změnil (bez horního panelu s hodinami)
+# where the picture changed (without the top bar and its clock)
 box = ImageChops.difference(a, b).point(lambda v: 255 if v > 40 else 0).crop((0, 60, 1920, 1080)).getbbox()
 if not box:
     sys.exit(1)
@@ -127,25 +130,25 @@ PY
 
 if [ -n "${MEASURE_RUNS:-}" ]; then
     echo "== Speed: command → first screenshot with the popup (median of $MEASURE_RUNS runs)"
-    # grim snímá v kole jen pruh pod panelem; čas = od odeslání příkazu po první snímek,
-    # který se od výchozího liší (okénko je vidět). Pak okénko zavřít a chvíli počkat.
+    # grim captures only the strip under the bar in a loop; time = from sending the command to the
+    # first capture that differs from the starting one (the popup is visible). Then close and wait.
     for p in calendar sound wifi battery notifications; do
         python3 -I - "$RT/apogee.sock" "$p" "$MEASURE_RUNS" <<'PY'
 import os, socket, statistics, subprocess, sys, time
-sok, prikaz, n = sys.argv[1], sys.argv[2], int(sys.argv[3])
-def poslat(t):
-    s = socket.socket(socket.AF_UNIX); s.connect(sok); s.send((t + "\n").encode()); s.close()
-def snimek():
+sock, cmd, n = sys.argv[1], sys.argv[2], int(sys.argv[3])
+def send(t):
+    s = socket.socket(socket.AF_UNIX); s.connect(sock); s.send((t + "\n").encode()); s.close()
+def shot():
     return subprocess.run(["grim", "-g", "0,46 1920x60", "-t", "ppm", "-"], capture_output=True).stdout
-casy = []
+times = []
 for _ in range(n):
-    vychozi = snimek()
-    t0 = time.perf_counter(); poslat(prikaz)
+    before = shot()
+    t0 = time.perf_counter(); send(cmd)
     while time.perf_counter() - t0 < 3:
-        if snimek() != vychozi:
-            casy.append((time.perf_counter() - t0) * 1000); break
-    poslat(prikaz); time.sleep(0.6)
-print(f"  info  {prikaz:<9} median {statistics.median(casy):5.0f} ms  (min {min(casy):.0f}, max {max(casy):.0f}, {len(casy)} runs)" if casy else f"  CHYBA {prikaz}: popup never appeared")
+        if shot() != before:
+            times.append((time.perf_counter() - t0) * 1000); break
+    send(cmd); time.sleep(0.6)
+print(f"  info  {cmd:<9} median {statistics.median(times):5.0f} ms  (min {min(times):.0f}, max {max(times):.0f}, {len(times)} runs)" if times else f"  FAIL {cmd}: popup never appeared")
 PY
     done
     t0=$(date +%s%N); timeout 5 grim -g "0,46 1920x60" -t ppm - >/dev/null; t1=$(date +%s%N)
@@ -153,29 +156,29 @@ PY
 fi
 
 echo "== Health"
-if kill -0 "$HPID" 2>/dev/null; then echo "  ok    daemon still running"; else echo "  CHYBA daemon is gone"; fi
-if grep -q panicked "$H/.cache/apogee/errors.log" 2>/dev/null; then echo "  CHYBA panic in errors.log:"; tail -4 "$H/.cache/apogee/errors.log"; else echo "  ok    no panic"; fi
+if kill -0 "$HPID" 2>/dev/null; then echo "  ok    daemon still running"; else echo "  FAIL daemon is gone"; fi
+if grep -q panicked "$H/.cache/apogee/errors.log" 2>/dev/null; then echo "  FAIL panic in errors.log:"; tail -4 "$H/.cache/apogee/errors.log"; else echo "  ok    no panic"; fi
 pss=$(awk '/^Pss:/{print int($2/1024)}' /proc/$HPID/smaps_rollup 2>/dev/null)
 echo "  info  daemon memory ${pss:-?} MB (PSS, software rendering)"
 echo "== Sway without the patch? (commands only the patched Sway knows)"
 if grep -qaF "close button: cairo" "$(command -v "$SWAY")"; then echo "  info  patched Sway"; else echo "  info  plain Sway"; fi
 for c in "maximize toggle" "snap left" "minimize"; do
-    vystup=$(swaymsg "$c" 2>&1)
-    if [[ "$vystup" == *nknown* ]]; then echo "  info  '$c' is unknown to this Sway"; else echo "  info  '$c' is known"; fi
+    out=$(swaymsg "$c" 2>&1)
+    if [[ "$out" == *nknown* ]]; then echo "  info  '$c' is unknown to this Sway"; else echo "  info  '$c' is known"; fi
 done
 kill "$HPID" 2>/dev/null; kill "$SWAYPID" 2>/dev/null; wait 2>/dev/null
 UVNITR
-# MERIT= je starší název pro MEASURE_RUNS
-export T RT H OUT DEMON SWAY MEASURE_RUNS=${MEASURE_RUNS:-${MERIT:-}}
-# i služby, které sběrnice spustí sama (portály, gvfs, dconf), dostanou jen testovací složky
+# MERIT= is the older name of MEASURE_RUNS
+export T RT H OUT DAEMON SWAY MEASURE_RUNS=${MEASURE_RUNS:-${MERIT:-}}
+# services the bus starts by itself (portals, gvfs, dconf) also get only the test folders
 env -u WAYLAND_DISPLAY -u DISPLAY -u SWAYSOCK -u I3SOCK XDG_RUNTIME_DIR="$RT" HOME="$H" GTK_A11Y=none \
-    dbus-run-session -- bash "$T/uvnitr.sh" 2>/dev/null | tee "$T/vysledek.txt"
-chyb=$(grep -c "CHYBA" "$T/vysledek.txt")
+    dbus-run-session -- bash "$T/inside.sh" 2>/dev/null | tee "$T/result.txt"
+failures=$(grep -c "FAIL" "$T/result.txt")
 
-# úklid: jen procesy z tohoto testu (podle jejich XDG_RUNTIME_DIR)
+# clean-up: only processes of this test (by their XDG_RUNTIME_DIR)
 for p in $(pgrep -u "$(id -u)" -f "apogee-daemon|sway -c $T|xdg-desktop-portal|gvfsd|dbus-daemon"); do
     tr '\0' '\n' < /proc/$p/environ 2>/dev/null | grep -qx "XDG_RUNTIME_DIR=$RT" && kill "$p" 2>/dev/null
 done
 rm -rf "$T"
 echo
-[ "$chyb" = 0 ] && { echo "All good. Screenshots: $OUT"; exit 0; } || { echo "Failures: $chyb (screenshots: $OUT)"; exit 1; }
+[ "$failures" = 0 ] && { echo "All good. Screenshots: $OUT"; exit 0; } || { echo "Failures: $failures (screenshots: $OUT)"; exit 1; }

@@ -1,0 +1,30 @@
+#!/bin/bash
+# Sets the wallpaper and recolours the whole desktop from it
+# (bar, dock, window borders, popups, lock screen, launcher, GTK app accent, Firefox, folder icons).
+#   set-wallpaper <image>
+# Colours for a particular wallpaper can be overridden in ~/.config/theme/palettes/<name>.json.
+set -euo pipefail
+[ -f "${1:-}" ] || { echo "Usage: set-wallpaper <image>"; exit 1; }
+wallpaper=$(realpath "$1")
+T=~/.config/theme
+
+# lock screen: the wallpaper blurred and darkened
+magick "$wallpaper[0]" -resize 1920x1080^ -gravity center -extent 1920x1080 \
+    -blur 0x28 -fill black -colorize 30% -quality 90 "$T/lock.jpg"
+
+python3 -I "$T/theme.py" "$wallpaper" "$T/lock.jpg"
+ln -sf "$wallpaper" "$T/wallpaper"
+
+# accent of GTK / libadwaita apps through gsettings (the exact colour comes from gtk.css)
+gsettings set org.gnome.desktop.interface accent-color "$(jq -r .gnome_accent "$T/palette.json")"
+# icons with folders in the wallpaper colour (dark or light to match the style)
+~/.config/sway/scripts/icons.sh
+
+# reload live, only when Sway is running
+export SWAYSOCK=${SWAYSOCK:-$(ls /run/user/$(id -u)/sway-ipc.*.sock 2>/dev/null | head -1)}
+if swaymsg -t get_version >/dev/null 2>&1; then
+    swaymsg reload >/dev/null                        # window colours, wallpaper
+    ~/.local/bin/apogee style 2>/dev/null || true    # bar, dock and popups: new colours right away
+fi
+echo "Wallpaper: $wallpaper"
+jq -r '"Colors: background \(.base), text \(.text), accents \(.accent) and \(.accent2)"' "$T/palette.json"

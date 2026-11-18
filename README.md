@@ -11,7 +11,7 @@ desktop that feels like GNOME or macOS, while Sway stays a normal, tiling-capabl
 
 > **Status:** personal project, built and used daily on one laptop (Lenovo Legion Y520, Fedora 44,
 > Sway 1.11). It works well there; elsewhere see [Requirements and limits](#requirements-and-limits).
-> Code comments are in Czech; everything on screen is in English.
+> Settings files from older versions with Czech keys are migrated automatically on start.
 
 ## What it does
 
@@ -61,27 +61,36 @@ Needs Rust, GTK 4 (4.20+) and gtk4-layer-shell. On Fedora:
 sudo dnf install rust cargo gtk4-devel gtk4-layer-shell-devel
 cargo build --release
 install -m755 target/release/apogee target/release/apogee-daemon ~/.local/bin/
+bash extras/install.sh        # theme generator, set-wallpaper and the Sway scripts (see below)
 ```
 
-In the Sway config:
+In the Sway config (`extras/install.sh` prints the full list):
 
 ```
-exec ~/.config/sway/scripts/apogee-watch.sh      # or simply: exec ~/.local/bin/apogee daemon
+set $scripts ~/.config/sway/scripts
+include ~/.config/sway/colors                 # colours from the wallpaper
+exec $scripts/apogee-watch.sh                 # Apogee, restarted if it ever crashes
+exec $scripts/night-light.sh
+exec $scripts/idle.sh
 bindsym $mod+space exec ~/.local/bin/apogee spotlight
 bindsym $mod+x     exec ~/.local/bin/apogee dock
 bindsym XF86AudioRaiseVolume exec ~/.local/bin/apogee osd vol-up
+include ~/.config/sway/settings.conf          # last: what the Settings app changes
 ```
 
-`apogee-watch.sh` (a small script from the author's setup, see below) restarts the daemon within a second if it ever crashes. It
-runs inside the Sway session on purpose: as a systemd service the daemon would lose its logind
-session, so `pkexec` and backlight control would stop working.
+Then pick a wallpaper with `set-wallpaper <image>` (or in Settings → Appearance).
+
+`apogee-watch.sh` restarts the daemon within a second if it ever crashes. It runs inside the
+Sway session on purpose: as a systemd service the daemon would lose its logind session, so
+`pkexec` and backlight control would stop working, and a restart would kill the apps started
+from the dock.
 
 **Commands** (`apogee <command>`): `settings [page]`, `sound`, `brightness`, `wifi`, `bluetooth`,
 `battery`, `weather`, `calendar`, `notifications`, `player`, `screenshot`, `recording`,
 `wallpapers`, `updates`, `window`, `clipboard`, `power`, `dock`, `launcher`, `spotlight [text]`,
 `alttab`, `alttab-back`, `osd vol-up|vol-down|vol-mute|brightness-up|brightness-down`,
 `music previous|next|play-pause`, `screenshot-now area|window|screen`, `dnd [on|off]`, `style`.
-The full list is at the top of [`src/klient.rs`](src/klient.rs).
+The full list is at the top of [`src/client.rs`](src/client.rs).
 
 **Files:** `~/.config/apogee/settings.json` (pinned apps, panel modules, clock, …),
 `~/.cache/apogee/` (notification history, file index, update status, error log).
@@ -114,35 +123,40 @@ the *Font Awesome 6 Free* and *Adwaita Sans* fonts, `brightnessctl`, `grim` + `s
 The backlight device is detected automatically. Lenovo battery conservation mode only shows up
 when the `ideapad_acpi` driver offers it.
 
-**Not part of this repository yet:** a few companion pieces that live in the author's (private)
-dotfiles. Without them those features don't work:
-- the wallpaper → colour theme generator (writes `~/.config/theme/palette.json` that Apogee reads;
-  without it Apogee uses its built-in dark colours),
-- small Sway scripts for night light, power modes and idle / lock times
-  (`~/.config/sway/scripts/night-light.sh`, `power-mode.sh`, `idle.sh`),
-- `apogee-watch.sh`, which restarts the daemon if it crashes.
+**Companion pieces in [`extras/`](extras/)** (installed by `extras/install.sh`):
+- `theme/theme.py` + `templates/` and `bin/set-wallpaper`: the wallpaper → colour theme generator.
+  It writes `~/.config/theme/palette.json` (Apogee's colours; without it Apogee uses built-in dark
+  colours) and colours for Sway, the lock screen, GTK apps, Firefox and Papirus folder icons,
+  dark or light. Needs ImageMagick and `jq`.
+- `sway-scripts/`: `apogee-watch.sh`, `night-light.sh`, `idle.sh` (with `dim.sh` and
+  `unless-playing.sh`), `power-mode.sh` and `icons.sh`.
 
 **Sway patch:** the author runs Sway with a patch (not published) that adds title bar buttons,
 maximize, snapping and minimize. With plain Sway everything else works (the smoke test checks
 this); only those commands are unavailable.
 
-**Code comments are in Czech**; names on screen, commands and documentation are English.
+Everything is in English. The only Czech words left are deliberate: search synonyms in Settings
+and Spotlight, and Czech unit names in the converter, so Czech queries work too.
 
 ## Source map
 
 | Path | Contents |
 |---|---|
-| `src/main.rs`, `src/klient.rs` | daemon and client |
-| `src/lista/` | top bar and tray |
-| `src/dok.rs`, `src/spoustec.rs` | dock and app grid |
-| `src/spotlight/` | search, calculator, conversions, file index |
-| `src/okenka/` | popups under the bar |
-| `src/upozorneni/` | notification server |
-| `src/nastaveni/` | Settings app (one file per page) |
-| `src/hesla_site.rs` | NetworkManager secret agent |
-| `src/sway.rs`, `src/styl.rs` | Sway IPC, theme CSS |
+| `src/main.rs`, `src/client.rs` | daemon and client |
+| `src/bar/` | top bar, its data sources and the tray |
+| `src/dock.rs`, `src/launcher.rs` | dock and app grid |
+| `src/spotlight/` | search, calculator, unit and currency conversion, system commands |
+| `src/popups/` | popups under the bar (sound, Wi-Fi, calendar, weather, player, power…) |
+| `src/notifier/` | notification server and bubbles |
+| `src/settings/` | the Settings app, one file per page |
+| `src/network_secrets.rs` | NetworkManager secret agent (Wi-Fi password prompts) |
+| `src/switcher.rs`, `src/osd.rs` | Alt+Tab switcher, volume / brightness indicator |
+| `src/sway.rs`, `src/style.rs`, `src/common.rs` | Sway IPC, theme CSS, shared helpers |
+| `src/music.rs`, `src/recording.rs`, `src/updates.rs`, `src/pomodoro.rs` | MPRIS, screenshots and recording, update checks, Pomodoro |
+| `src/migrate.rs` | one-time migration of settings from older versions |
+| `extras/` | theme generator, `set-wallpaper` and Sway scripts |
 | `tests/` | smoke test and virtual input tools |
-| `NAVRH-NASTAVENI.md` | Settings design notes (Czech) |
+| `docs/settings-design.md` | design notes for the Settings app |
 
 ## Licence
 

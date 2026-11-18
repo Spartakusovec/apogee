@@ -1,20 +1,20 @@
-//! Spotlight (Super+mezerník): jedno pole nahoře uprostřed obrazovky a pod ním výsledky.
+//! Spotlight (Super+Space): one field at the top centre of the screen with the results under it.
 //!
-//!   aplikace      – podle názvu, popisu a názvu programu; často spouštěné výš
-//!   kalkulačka    – „2+3*4“, „200 + 10%“, „sqrt(2)“; Enter zkopíruje výsledek
-//!   převody       – „10 km to mi“, „100 eur na kč“ (kurzy ECB)
-//!   příkazy       – „lock“, „restart“, „wifi“, „tapeta“… (anglicky i česky)
-//!   soubory       – naposledy otevřené a ze složky domov (plocate); Ctrl+Enter ukáže soubor ve složce.
-//!                   Vlastní index domova (bez skrytých složek, ~/.cache/apogee/files.db) se obnoví
-//!                   při otevření, když je starší než 2 minuty (systémový se obnovuje jen jednou denně).
-//!   web           – poslední řádek: hledat na webu (Firefox, výchozí vyhledávač)
+//!   apps         – by name, description and program name; often started ones higher
+//!   calculator   – “2+3*4”, “200 + 10%”, “sqrt(2)”; Enter copies the result
+//!   conversions  – “10 km to mi”, “100 eur to czk” (ECB rates)
+//!   commands     – “lock”, “restart”, “wifi”, “wallpaper”… (in English and Czech)
+//!   files        – recently opened and from the home folder (plocate); Ctrl+Enter shows the file in its folder.
+//!                   Its own index of the home folder (without hidden folders, ~/.cache/apogee/files.db) is refreshed
+//!                   on opening when it's older than 2 minutes (the system one is refreshed only once a day).
+//!   web          – the last row: search the web (Firefox, default search engine)
 //!
-//! Šipky vybírají, Enter spustí, Esc nebo klik mimo zavře. Okno se sestaví jednou a pak se jen
-//! ukazuje, takže je hned na obrazovce.
+//! Arrows select, Enter runs, Esc or a click outside closes. The window is built once and then only
+//! shown, so it's on screen instantly.
 
-mod jednotky;
-mod kalkulacka;
-mod prikazy;
+mod units;
+mod calculator;
+mod commands;
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -27,34 +27,34 @@ use gtk::prelude::*;
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use serde_json::json;
 
-use crate::spolecne::*;
+use crate::common::*;
 
-const IKONA: i32 = 38;
-const NEJVIC_APLIKACI: usize = 6;
-const NEJVIC_SOUBORU: usize = 6;
+const ICON: i32 = 38;
+const MAX_APPS: usize = 6;
+const MAX_FILES: usize = 6;
 
-/// Co udělá řádek (true = s Ctrl).
-type Akce = Rc<dyn Fn(bool)>;
+/// What a row does (true = with Ctrl).
+type Action = Rc<dyn Fn(bool)>;
 
 struct Spotlight {
-    okno: gtk::Window,
+    window: gtk::Window,
     panel: gtk::Box,
-    hledat: gtk::Entry,
-    posuv: gtk::ScrolledWindow,
-    seznam: gtk::ListBox,
-    /// vybratelné řádky a co dělají
-    radky: RefCell<Vec<(gtk::ListBoxRow, Akce)>>,
-    aplikace: RefCell<Vec<(gio::AppInfo, String, String)>>,
-    /// výsledky hledání souborů k dotazu (dotaz, cesty)
-    soubory: RefCell<(String, Vec<PathBuf>)>,
-    hledani_souboru: RefCell<Option<glib::SourceId>>,
+    search: gtk::Entry,
+    scroll: gtk::ScrolledWindow,
+    list: gtk::ListBox,
+    /// selectable rows and what they do
+    rows: RefCell<Vec<(gtk::ListBoxRow, Action)>>,
+    apps: RefCell<Vec<(gio::AppInfo, String, String)>>,
+    /// file search results for a query (query, paths)
+    files: RefCell<(String, Vec<PathBuf>)>,
+    search_files: RefCell<Option<glib::SourceId>>,
 }
 
 thread_local! {
     static SPOTLIGHT: RefCell<Option<Rc<Spotlight>>> = const { RefCell::new(None) };
 }
 
-pub fn bez_diakritiky(text: &str) -> String {
+pub fn without_diacritics(text: &str) -> String {
     text.chars()
         .map(|c| match c {
             'á' => 'a',
@@ -75,11 +75,11 @@ pub fn bez_diakritiky(text: &str) -> String {
         .collect()
 }
 
-fn normalizovat(text: &str) -> String {
-    bez_diakritiky(&text.to_lowercase())
+fn normalize(text: &str) -> String {
+    without_diacritics(&text.to_lowercase())
 }
 
-fn ted() -> u64 {
+fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
@@ -87,37 +87,37 @@ fn spotlight() -> Option<Rc<Spotlight>> {
     SPOTLIGHT.with(|s| s.borrow().clone())
 }
 
-/// Sestaví okno chvíli po startu démona a jednou ho neviditelně vykreslí.
-pub fn pripravit() {
+/// Builds the window shortly after the daemon starts and draws it once invisibly.
+pub fn prepare() {
     glib::timeout_add_local_once(Duration::from_secs(4), || {
-        let s = ziskat();
-        s.okno.set_opacity(0.01);
-        s.okno.set_visible(true);
+        let s = get();
+        s.window.set_opacity(0.01);
+        s.window.set_visible(true);
         glib::timeout_add_local_once(Duration::from_millis(300), || {
             if let Some(s) = spotlight() {
-                s.okno.set_visible(false);
-                s.okno.set_opacity(1.0);
+                s.window.set_visible(false);
+                s.window.set_opacity(1.0);
             }
         });
     });
 }
 
-fn ziskat() -> Rc<Spotlight> {
+fn get() -> Rc<Spotlight> {
     if let Some(s) = spotlight() {
         return s;
     }
-    crate::styl::pouzit();
-    let okno = gtk::Window::new();
-    okno.add_css_class("apogee");
-    okno.add_css_class("spotlight");
-    okno.init_layer_shell();
-    okno.set_layer(Layer::Overlay);
-    okno.set_namespace(Some("spotlight"));
-    okno.set_exclusive_zone(-1);
+    crate::style::apply();
+    let window = gtk::Window::new();
+    window.add_css_class("apogee");
+    window.add_css_class("spotlight");
+    window.init_layer_shell();
+    window.set_layer(Layer::Overlay);
+    window.set_namespace(Some("spotlight"));
+    window.set_exclusive_zone(-1);
     for k in [Edge::Top, Edge::Bottom, Edge::Left, Edge::Right] {
-        okno.set_anchor(k, true);
+        window.set_anchor(k, true);
     }
-    okno.set_keyboard_mode(KeyboardMode::Exclusive);
+    window.set_keyboard_mode(KeyboardMode::Exclusive);
 
     let panel = gtk::Box::new(gtk::Orientation::Vertical, 0);
     panel.set_widget_name("panel");
@@ -125,161 +125,161 @@ fn ziskat() -> Rc<Spotlight> {
     panel.set_valign(gtk::Align::Start);
     panel.set_margin_top(150);
     panel.set_size_request(780, -1);
-    let pole = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    pole.add_css_class("spotlight-pole");
-    pole.append(&ikona("\u{f002}", "spotlight-lupa"));
-    let hledat = gtk::Entry::new();
-    hledat.set_placeholder_text(Some("Search apps, files, calculate, convert…"));
-    hledat.set_hexpand(true);
-    pole.append(&hledat);
-    panel.append(&pole);
-    let seznam = gtk::ListBox::new();
-    seznam.add_css_class("spotlight-vysledky");
-    seznam.set_selection_mode(gtk::SelectionMode::Single);
-    let posuv = gtk::ScrolledWindow::new();
-    posuv.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
-    posuv.set_propagate_natural_height(true);
-    posuv.set_max_content_height(600);
-    posuv.set_child(Some(&seznam));
-    posuv.set_visible(false);
-    panel.append(&posuv);
-    let pozadi = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    pozadi.set_hexpand(true);
-    pozadi.set_vexpand(true);
-    pozadi.append(&panel);
-    okno.set_child(Some(&pozadi));
+    let field = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    field.add_css_class("spotlight-field");
+    field.append(&icon("\u{f002}", "spotlight-zoom"));
+    let search = gtk::Entry::new();
+    search.set_placeholder_text(Some("Search apps, files, calculate, convert…"));
+    search.set_hexpand(true);
+    field.append(&search);
+    panel.append(&field);
+    let list = gtk::ListBox::new();
+    list.add_css_class("spotlight-results");
+    list.set_selection_mode(gtk::SelectionMode::Single);
+    let scroll = gtk::ScrolledWindow::new();
+    scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    scroll.set_propagate_natural_height(true);
+    scroll.set_max_content_height(600);
+    scroll.set_child(Some(&list));
+    scroll.set_visible(false);
+    panel.append(&scroll);
+    let background = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    background.set_hexpand(true);
+    background.set_vexpand(true);
+    background.append(&panel);
+    window.set_child(Some(&background));
 
     let s = Rc::new(Spotlight {
-        okno: okno.clone(),
+        window: window.clone(),
         panel,
-        hledat: hledat.clone(),
-        posuv,
-        seznam: seznam.clone(),
-        radky: RefCell::new(Vec::new()),
-        aplikace: RefCell::new(Vec::new()),
-        soubory: RefCell::new((String::new(), Vec::new())),
-        hledani_souboru: RefCell::new(None),
+        search: search.clone(),
+        scroll,
+        list: list.clone(),
+        rows: RefCell::new(Vec::new()),
+        apps: RefCell::new(Vec::new()),
+        files: RefCell::new((String::new(), Vec::new())),
+        search_files: RefCell::new(None),
     });
 
-    hledat.connect_changed(|_| {
+    search.connect_changed(|_| {
         if let Some(s) = spotlight() {
-            s.vykreslit();
-            s.naplanovat_hledani_souboru();
+            s.draw();
+            s.schedule_search_files();
         }
     });
-    // klávesy dřív, než je dostane pole: šipky vybírají, Enter spustí, Esc zavře
-    let klavesy = gtk::EventControllerKey::new();
-    klavesy.set_propagation_phase(gtk::PropagationPhase::Capture);
-    klavesy.connect_key_pressed(|_, k, _, mod_| {
+    // keys before the field gets them: arrows select, Enter runs, Esc closes
+    let keys = gtk::EventControllerKey::new();
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    keys.connect_key_pressed(|_, k, _, mod_| {
         use gtk::gdk::Key;
         let Some(s) = spotlight() else { return glib::Propagation::Proceed };
         match k {
-            Key::Escape => schovat(),
-            Key::Down | Key::Tab => s.posunout(1),
-            Key::Up | Key::ISO_Left_Tab => s.posunout(-1),
-            Key::Return | Key::KP_Enter => s.spustit_vybrany(mod_.contains(gtk::gdk::ModifierType::CONTROL_MASK)),
+            Key::Escape => hide(),
+            Key::Down | Key::Tab => s.move_(1),
+            Key::Up | Key::ISO_Left_Tab => s.move_(-1),
+            Key::Return | Key::KP_Enter => s.start_selected(mod_.contains(gtk::gdk::ModifierType::CONTROL_MASK)),
             _ => return glib::Propagation::Proceed,
         }
         glib::Propagation::Stop
     });
-    okno.add_controller(klavesy);
-    seznam.connect_row_activated(|_, r| {
+    window.add_controller(keys);
+    list.connect_row_activated(|_, r| {
         if let Some(s) = spotlight() {
-            s.seznam.select_row(Some(r));
-            s.spustit_vybrany(false);
+            s.list.select_row(Some(r));
+            s.start_selected(false);
         }
     });
-    // klik mimo panel zavře
-    let klik = gtk::GestureClick::new();
-    klik.connect_released(|g, _, x, y| {
+    // a click outside the panel closes it
+    let click = gtk::GestureClick::new();
+    click.connect_released(|g, _, x, y| {
         if let Some(s) = spotlight() {
-            let uvnitr = s.okno.pick(x, y, gtk::PickFlags::DEFAULT).is_some_and(|w| w == *s.panel.upcast_ref::<gtk::Widget>() || w.is_ancestor(&s.panel));
-            if !uvnitr {
+            let inside = s.window.pick(x, y, gtk::PickFlags::DEFAULT).is_some_and(|w| w == *s.panel.upcast_ref::<gtk::Widget>() || w.is_ancestor(&s.panel));
+            if !inside {
                 g.set_state(gtk::EventSequenceState::Claimed);
-                schovat();
+                hide();
             }
         }
     });
-    okno.add_controller(klik);
+    window.add_controller(click);
 
     SPOTLIGHT.with(|x| x.replace(Some(s.clone())));
-    s.nacist_aplikace();
+    s.load_apps();
     s
 }
 
-/// Otevřít / zavřít; s textem otevře rovnou s tímhle hledáním.
-pub fn prepnout(text: &str) {
-    let s = ziskat();
-    if s.okno.is_visible() && text.is_empty() {
-        schovat();
+/// Open / close; with a text, opens right away with that search.
+pub fn toggle(text: &str) {
+    let s = get();
+    if s.window.is_visible() && text.is_empty() {
+        hide();
         return;
     }
-    crate::okenka::zavrit();
-    s.nacist_aplikace();
-    obnovit_index();
-    s.hledat.set_text(text);
-    s.vykreslit();
-    s.okno.set_visible(true);
-    // kurzor na konec, text neoznačovat (ať se dá rovnou psát dál)
-    s.hledat.grab_focus_without_selecting();
-    s.hledat.set_position(-1);
-    // kurzy měn na pozadí, ať jsou po ruce
-    if jednotky::kurzy_zastarale() {
-        na_pozadi(jednotky::stahnout_kurzy, |_| {});
+    crate::popups::close();
+    s.load_apps();
+    refresh_index();
+    s.search.set_text(text);
+    s.draw();
+    s.window.set_visible(true);
+    // cursor to the end, don't select the text (so you can keep typing)
+    s.search.grab_focus_without_selecting();
+    s.search.set_position(-1);
+    // currency rates in the background, so they're at hand
+    if units::rates_stale() {
+        in_background(units::download_rates, |_| {});
     }
 }
 
-fn schovat() {
+fn hide() {
     if let Some(s) = spotlight() {
-        s.okno.set_visible(false);
-        if let Some(id) = s.hledani_souboru.take() {
+        s.window.set_visible(false);
+        if let Some(id) = s.search_files.take() {
             id.remove();
         }
     }
 }
 
-/// Kolikrát a kdy naposledy byla aplikace spuštěná ze spotlightu: {"id": [počet, čas]}.
-fn pouzivani() -> serde_json::Value {
-    nastaveni("spotlight")["pouziti"].clone()
+/// How many times and when an app was last started from Spotlight: {"id": [count, time]}.
+fn usage() -> serde_json::Value {
+    settings("spotlight")["usage"].clone()
 }
 
-fn zapsat_pouziti(id: &str) {
-    let mut v = nastaveni("spotlight");
+fn write_usage(id: &str) {
+    let mut v = settings("spotlight");
     if !v.is_object() {
         v = json!({});
     }
-    let pocet = v["pouziti"][id][0].as_u64().unwrap_or(0) + 1;
-    if !v["pouziti"].is_object() {
-        v["pouziti"] = json!({});
+    let count = v["usage"][id][0].as_u64().unwrap_or(0) + 1;
+    if !v["usage"].is_object() {
+        v["usage"] = json!({});
     }
-    v["pouziti"][id] = json!([pocet, ted()]);
-    ulozit_nastaveni("spotlight", v);
+    v["usage"][id] = json!([count, now()]);
+    save_settings("spotlight", v);
 }
 
 /// Ikona souboru podle typu.
-fn ikona_souboru(cesta: &Path) -> gtk::Image {
-    let ikona = if cesta.is_dir() {
+fn icon_files(path: &Path) -> gtk::Image {
+    let icon = if path.is_dir() {
         gio::ThemedIcon::new("folder").upcast::<gio::Icon>()
     } else {
-        let (typ, _) = gio::content_type_guess(Some(cesta), None);
+        let (typ, _) = gio::content_type_guess(Some(path), None);
         gio::content_type_get_icon(&typ)
     };
-    let i = gtk::Image::from_gicon(&ikona);
-    i.set_pixel_size(IKONA);
+    let i = gtk::Image::from_gicon(&icon);
+    i.set_pixel_size(ICON);
     i
 }
 
-fn zkratit(cesta: &Path) -> String {
-    let d = domov();
-    match cesta.strip_prefix(&d) {
-        Ok(zbytek) => format!("~/{}", zbytek.display()),
-        Err(_) => cesta.display().to_string(),
+fn shorten(path: &Path) -> String {
+    let d = home();
+    match path.strip_prefix(&d) {
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
     }
 }
 
-/// Ukáže soubor ve správci souborů (Ctrl+Enter).
-fn ukazat_ve_slozce(cesta: &Path) {
-    let uri = gio::File::for_path(cesta).uri().to_string();
+/// Shows the file in the file manager (Ctrl+Enter).
+fn show_ve_folder(path: &Path) {
+    let uri = gio::File::for_path(path).uri().to_string();
     if let Ok(s) = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE) {
         s.call(
             Some("org.freedesktop.FileManager1"),
@@ -296,53 +296,53 @@ fn ukazat_ve_slozce(cesta: &Path) {
     }
 }
 
-fn otevrit(cesta: &Path) {
-    let uri = gio::File::for_path(cesta).uri();
-    let kontext = gtk::gdk::Display::default().map(|d| d.app_launch_context());
-    let _ = gio::AppInfo::launch_default_for_uri(&uri, kontext.as_ref());
+fn open(path: &Path) {
+    let uri = gio::File::for_path(path).uri();
+    let context = gtk::gdk::Display::default().map(|d| d.app_launch_context());
+    let _ = gio::AppInfo::launch_default_for_uri(&uri, context.as_ref());
 }
 
-fn kopirovat(text: &str) {
+fn copy(text: &str) {
     if let Some(d) = gtk::gdk::Display::default() {
         d.clipboard().set_text(text);
     }
-    // schránka Waylandu patří oknu, které ji nastavilo: ať přežije zavření spotlightu
-    pozadi("wl-copy", &[text]);
+    // the Wayland clipboard belongs to the window that set it: make it survive Spotlight closing
+    background("wl-copy", &[text]);
 }
 
-fn hledat_na_webu(dotaz: &str) {
+fn search_on_web(query: &str) {
     let firefox = gio::AppInfo::all().into_iter().any(|a| a.id().is_some_and(|i| i == "org.mozilla.firefox.desktop"));
     if firefox {
-        pozadi("flatpak", &["run", "org.mozilla.firefox", "--search", dotaz]);
+        background("flatpak", &["run", "org.mozilla.firefox", "--search", query]);
     } else {
-        let uri = format!("https://duckduckgo.com/?q={}", glib::Uri::escape_string(dotaz, None, false));
-        pozadi("xdg-open", &[&uri]);
+        let uri = format!("https://duckduckgo.com/?q={}", glib::Uri::escape_string(query, None, false));
+        background("xdg-open", &[&uri]);
     }
 }
 
-fn index_souboru() -> PathBuf {
-    domov().join(".cache/apogee/files.db")
+fn index_files() -> PathBuf {
+    home().join(".cache/apogee/files.db")
 }
 
 thread_local! {
     static INDEXUJE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Obnoví index domova na pozadí (nejvýš jednou za 2 minuty); pak zopakuje rozepsané hledání,
-/// ať se ukáže i soubor stažený před chvílí.
-fn obnovit_index() {
-    let db = index_souboru();
+/// Refreshes the home index in the background (at most every 2 minutes); then repeats the search being typed,
+/// so a file downloaded a moment ago shows up too.
+fn refresh_index() {
+    let db = index_files();
     let cerstvy = std::fs::metadata(&db)
         .and_then(|m| m.modified())
         .is_ok_and(|t| t.elapsed().is_ok_and(|e| e < Duration::from_secs(120)));
     if cerstvy || INDEXUJE.with(|i| i.replace(true)) {
         return;
     }
-    na_pozadi(
+    in_background(
         move || {
-            let domov = domov();
-            // skryté složky Spotlight neukazuje, nemusí ani do indexu
-            let skryte: Vec<String> = std::fs::read_dir(&domov)
+            let home = home();
+            // Spotlight doesn't show hidden folders, so they needn't be in the index either
+            let hidden: Vec<String> = std::fs::read_dir(&home)
                 .map(|d| {
                     d.flatten()
                         .filter(|e| e.file_name().to_string_lossy().starts_with('.') && e.file_type().is_ok_and(|t| t.is_dir()))
@@ -350,44 +350,44 @@ fn obnovit_index() {
                         .collect()
                 })
                 .unwrap_or_default();
-            let _ = std::fs::create_dir_all(db.parent().unwrap_or(&domov));
-            let (domov, db) = (domov.to_string_lossy().to_string(), db.to_string_lossy().to_string());
-            prikaz("nice", &["-n", "19", "ionice", "-c", "3", "updatedb", "-l", "0", "-U", &domov, "-o", &db, "-e", &skryte.join(" ")]);
+            let _ = std::fs::create_dir_all(db.parent().unwrap_or(&home));
+            let (home, db) = (home.to_string_lossy().to_string(), db.to_string_lossy().to_string());
+            command("nice", &["-n", "19", "ionice", "-c", "3", "updatedb", "-l", "0", "-U", &home, "-o", &db, "-e", &hidden.join(" ")]);
         },
         |_| {
             INDEXUJE.with(|i| i.set(false));
             if let Some(s) = spotlight() {
-                if s.okno.is_visible() {
-                    s.naplanovat_hledani_souboru();
+                if s.window.is_visible() {
+                    s.schedule_search_files();
                 }
             }
         },
     );
 }
 
-/// Soubory z domovské složky (plocate) a naposledy otevřené; pomalé, volat mimo GTK.
-fn najit_soubory(dotaz: &str) -> Vec<PathBuf> {
-    let slova: Vec<String> = dotaz.split_whitespace().map(str::to_string).collect();
-    if slova.is_empty() || dotaz.chars().count() < 2 {
+/// Files from the home folder (plocate) and recently opened ones; slow, call outside GTK.
+fn find_files(query: &str) -> Vec<PathBuf> {
+    let words: Vec<String> = query.split_whitespace().map(str::to_string).collect();
+    if words.is_empty() || query.chars().count() < 2 {
         return Vec::new();
     }
-    let domov = domov();
+    let home = home();
     let mut args = vec!["-i".to_string(), "-b".into(), "-l".into(), "400".into()];
-    // vlastní čerstvý index domova, jinak systémový
-    let db = index_souboru();
+    // our own fresh home index, otherwise the system one
+    let db = index_files();
     if db.exists() {
         args.extend(["-d".to_string(), db.to_string_lossy().to_string()]);
     }
     args.push("--".into());
-    args.extend(slova.iter().cloned());
+    args.extend(words.iter().cloned());
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let vynechat = ["node_modules", "target", "__pycache__", "site-packages", "venv"];
-    let mut nalezene: Vec<PathBuf> = prikaz("plocate", &args)
+    let mut found: Vec<PathBuf> = command("plocate", &args)
         .lines()
         .map(PathBuf::from)
-        .filter(|p| p.starts_with(&domov))
+        .filter(|p| p.starts_with(&home))
         .filter(|p| {
-            p.strip_prefix(&domov).map_or(false, |z| {
+            p.strip_prefix(&home).map_or(false, |z| {
                 z.components().all(|c| {
                     let c = c.as_os_str().to_string_lossy();
                     !c.starts_with('.') && !vynechat.contains(&c.as_ref())
@@ -396,188 +396,188 @@ fn najit_soubory(dotaz: &str) -> Vec<PathBuf> {
         })
         .filter(|p| p.exists())
         .collect();
-    // názvy začínající hledaným textem první, pak kratší cesty
-    let prvni = normalizovat(&slova[0]);
-    nalezene.sort_by_key(|p| {
-        let jmeno = normalizovat(&p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
-        (!jmeno.starts_with(&prvni), p.components().count(), jmeno.len())
+    // names starting with the searched text first, then shorter paths
+    let first = normalize(&words[0]);
+    found.sort_by_key(|p| {
+        let name = normalize(&p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
+        (!name.starts_with(&first), p.components().count(), name.len())
     });
-    nalezene.truncate(NEJVIC_SOUBORU * 2);
-    nalezene
+    found.truncate(MAX_FILES * 2);
+    found
 }
 
 impl Spotlight {
-    fn nacist_aplikace(&self) {
+    fn load_apps(&self) {
         let mut v: Vec<(gio::AppInfo, String, String)> = gio::AppInfo::all()
             .into_iter()
             .filter(|a| a.should_show())
             .map(|a| {
-                let jmeno = normalizovat(&a.display_name());
-                let ostatni = normalizovat(&format!("{} {}", a.description().unwrap_or_default(), a.executable().to_string_lossy()));
-                (a, jmeno, ostatni)
+                let name = normalize(&a.display_name());
+                let ostatni = normalize(&format!("{} {}", a.description().unwrap_or_default(), a.executable().to_string_lossy()));
+                (a, name, ostatni)
             })
             .collect();
         v.sort_by(|a, b| a.1.cmp(&b.1));
-        self.aplikace.replace(v);
+        self.apps.replace(v);
     }
 
-    fn naplanovat_hledani_souboru(&self) {
-        if let Some(id) = self.hledani_souboru.take() {
+    fn schedule_search_files(&self) {
+        if let Some(id) = self.search_files.take() {
             id.remove();
         }
-        let dotaz = self.hledat.text().trim().to_string();
-        if dotaz.chars().count() < 2 || kalkulacka::spocitat(&dotaz).is_some() || jednotky::prevest(&dotaz).is_some() {
+        let query = self.search.text().trim().to_string();
+        if query.chars().count() < 2 || calculator::compute(&query).is_some() || units::convert(&query).is_some() {
             return;
         }
-        // až se chvilku nepíše
+        // once typing pauses for a moment
         let id = glib::timeout_add_local_once(Duration::from_millis(120), move || {
             if let Some(s) = spotlight() {
-                s.hledani_souboru.replace(None);
+                s.search_files.replace(None);
             }
-            let d = dotaz.clone();
-            na_pozadi(
-                move || najit_soubory(&d),
-                move |nalezene| {
+            let d = query.clone();
+            in_background(
+                move || find_files(&d),
+                move |found| {
                     if let Some(s) = spotlight() {
-                        if s.hledat.text().trim() == dotaz && s.okno.is_visible() {
-                            s.soubory.replace((dotaz, nalezene));
-                            s.vykreslit();
+                        if s.search.text().trim() == query && s.window.is_visible() {
+                            s.files.replace((query, found));
+                            s.draw();
                         }
                     }
                 },
             );
         });
-        self.hledani_souboru.replace(Some(id));
+        self.search_files.replace(Some(id));
     }
 
-    /// Nadpis skupiny výsledků (nedá se vybrat).
-    fn nadpis(&self, text: &str) {
+    /// Heading of a result group (can't be selected).
+    fn title(&self, text: &str) {
         let r = gtk::ListBoxRow::new();
         r.set_selectable(false);
         r.set_activatable(false);
         r.set_can_focus(false);
-        r.add_css_class("skupina");
-        r.set_child(Some(&popisek(text, &["dim"])));
-        self.seznam.append(&r);
+        r.add_css_class("group");
+        r.set_child(Some(&label(text, &["dim"])));
+        self.list.append(&r);
     }
 
-    fn radek(&self, ikona_widget: gtk::Widget, nazev: &str, popis: &str, akce: Akce) {
-        let obsah = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-        ikona_widget.set_size_request(IKONA, IKONA);
-        ikona_widget.set_valign(gtk::Align::Center);
-        obsah.append(&ikona_widget);
-        let texty = gtk::Box::new(gtk::Orientation::Vertical, 1);
-        texty.set_valign(gtk::Align::Center);
-        texty.set_hexpand(true);
-        let n = popisek(nazev, &["vysledek"]);
+    fn row(&self, icon_widget: gtk::Widget, name: &str, description: &str, action: Action) {
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        icon_widget.set_size_request(ICON, ICON);
+        icon_widget.set_valign(gtk::Align::Center);
+        content.append(&icon_widget);
+        let texts = gtk::Box::new(gtk::Orientation::Vertical, 1);
+        texts.set_valign(gtk::Align::Center);
+        texts.set_hexpand(true);
+        let n = label(name, &["result"]);
         n.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        texty.append(&n);
-        if !popis.is_empty() {
-            let p = popisek(popis, &["dim"]);
+        texts.append(&n);
+        if !description.is_empty() {
+            let p = label(description, &["dim"]);
             p.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-            texty.append(&p);
+            texts.append(&p);
         }
-        obsah.append(&texty);
+        content.append(&texts);
         let r = gtk::ListBoxRow::new();
-        r.set_child(Some(&obsah));
-        self.seznam.append(&r);
-        self.radky.borrow_mut().push((r, akce));
+        r.set_child(Some(&content));
+        self.list.append(&r);
+        self.rows.borrow_mut().push((r, action));
     }
 
-    fn fa(znak: &str) -> gtk::Widget {
-        ikona(znak, "spotlight-ikona").upcast()
+    fn fa(char: &str) -> gtk::Widget {
+        icon(char, "spotlight-icon").upcast()
     }
 
-    fn vykreslit(self: &Rc<Self>) {
-        while let Some(r) = self.seznam.first_child() {
-            self.seznam.remove(&r);
+    fn draw(self: &Rc<Self>) {
+        while let Some(r) = self.list.first_child() {
+            self.list.remove(&r);
         }
-        self.radky.borrow_mut().clear();
-        let dotaz = self.hledat.text().trim().to_string();
-        if dotaz.is_empty() {
-            self.posuv.set_visible(false);
+        self.rows.borrow_mut().clear();
+        let query = self.search.text().trim().to_string();
+        if query.is_empty() {
+            self.scroll.set_visible(false);
             return;
         }
-        let d = normalizovat(&dotaz);
+        let d = normalize(&query);
 
-        // kalkulačka a převody
-        if let Some(x) = kalkulacka::spocitat(&dotaz) {
-            let v = kalkulacka::formatovat(x, dotaz.contains(','));
-            let kopie = v.clone();
-            self.radek(Self::fa("\u{f1ec}"), &format!("= {v}"), "Calculator · Enter copies the result", Rc::new(move |_| kopirovat(&kopie)));
-        } else if let Some(p) = jednotky::prevest(&dotaz) {
-            let kopie = p.vysledek.clone();
-            self.radek(Self::fa("\u{f362}"), &p.nadpis, &p.popis, Rc::new(move |_| {
-                if !kopie.is_empty() {
-                    kopirovat(&kopie)
+        // calculator and conversions
+        if let Some(x) = calculator::compute(&query) {
+            let v = calculator::format(x, query.contains(','));
+            let to_copy = v.clone();
+            self.row(Self::fa("\u{f1ec}"), &format!("= {v}"), "Calculator · Enter copies the result", Rc::new(move |_| copy(&to_copy)));
+        } else if let Some(p) = units::convert(&query) {
+            let to_copy = p.result.clone();
+            self.row(Self::fa("\u{f362}"), &p.title, &p.description, Rc::new(move |_| {
+                if !to_copy.is_empty() {
+                    copy(&to_copy)
                 }
             }));
-            if p.ceka_na_kurzy {
-                na_pozadi(jednotky::stahnout_kurzy, |ok| {
+            if p.ceka_on_rates {
+                in_background(units::download_rates, |ok| {
                     if let (true, Some(s)) = (ok, spotlight()) {
-                        s.vykreslit();
+                        s.draw();
                     }
                 });
             }
         }
 
-        // aplikace: shoda na začátku názvu > na začátku slova > kdekoli > v popisu; často spouštěné výš
-        let pouziti = pouzivani();
-        let mut aplikace: Vec<(i64, gio::AppInfo)> = self
-            .aplikace
+        // apps: match at the start of the name > at the start of a word > anywhere > in the description; often started ones higher
+        let usage = usage();
+        let mut apps: Vec<(i64, gio::AppInfo)> = self
+            .apps
             .borrow()
             .iter()
-            .filter_map(|(a, jmeno, ostatni)| {
-                let shoda = if jmeno.starts_with(&d) {
+            .filter_map(|(a, name, ostatni)| {
+                let shoda = if name.starts_with(&d) {
                     300
-                } else if jmeno.split(|c: char| !c.is_alphanumeric()).any(|s| s.starts_with(&d)) {
+                } else if name.split(|c: char| !c.is_alphanumeric()).any(|s| s.starts_with(&d)) {
                     200
-                } else if jmeno.contains(&d) {
+                } else if name.contains(&d) {
                     120
-                } else if d.split_whitespace().all(|s| jmeno.contains(s) || ostatni.contains(s)) {
+                } else if d.split_whitespace().all(|s| name.contains(s) || ostatni.contains(s)) {
                     40
                 } else {
                     return None;
                 };
                 let id = a.id().map(|i| i.to_string()).unwrap_or_default();
-                let pocet = pouziti[&id][0].as_u64().unwrap_or(0) as f64;
-                let nedavno = ted().saturating_sub(pouziti[&id][1].as_u64().unwrap_or(0)) < 7 * 86400;
-                Some((shoda + (30.0 * (1.0 + pocet).ln()) as i64 + if nedavno { 20 } else { 0 }, a.clone()))
+                let count = usage[&id][0].as_u64().unwrap_or(0) as f64;
+                let nedavno = now().saturating_sub(usage[&id][1].as_u64().unwrap_or(0)) < 7 * 86400;
+                Some((shoda + (30.0 * (1.0 + count).ln()) as i64 + if nedavno { 20 } else { 0 }, a.clone()))
             })
             .collect();
-        aplikace.sort_by(|a, b| b.0.cmp(&a.0));
-        if !aplikace.is_empty() {
-            self.nadpis("Apps");
+        apps.sort_by(|a, b| b.0.cmp(&a.0));
+        if !apps.is_empty() {
+            self.title("Apps");
         }
-        for (_, a) in aplikace.into_iter().take(NEJVIC_APLIKACI) {
-            let obrazek = match a.icon() {
+        for (_, a) in apps.into_iter().take(MAX_APPS) {
+            let image = match a.icon() {
                 Some(i) => gtk::Image::from_gicon(&i),
                 None => gtk::Image::from_icon_name("application-x-executable"),
             };
-            obrazek.set_pixel_size(IKONA);
-            let popis = a.description().map(|d| d.to_string()).unwrap_or_default();
+            image.set_pixel_size(ICON);
+            let description = a.description().map(|d| d.to_string()).unwrap_or_default();
             let a2 = a.clone();
-            self.radek(obrazek.upcast(), &a.display_name(), &popis, Rc::new(move |_| {
+            self.row(image.upcast(), &a.display_name(), &description, Rc::new(move |_| {
                 if let Some(id) = a2.id() {
-                    zapsat_pouziti(&id);
+                    write_usage(&id);
                 }
-                let kontext = gtk::gdk::Display::default().map(|d| d.app_launch_context());
-                let _ = a2.launch(&[], kontext.as_ref());
+                let context = gtk::gdk::Display::default().map(|d| d.app_launch_context());
+                let _ = a2.launch(&[], context.as_ref());
             }));
         }
 
-        // příkazy
-        let prikazy = prikazy::najit(&dotaz);
-        if !prikazy.is_empty() {
-            self.nadpis("System");
+        // commands
+        let commands = commands::find(&query);
+        if !commands.is_empty() {
+            self.title("System");
         }
-        for p in prikazy.into_iter().take(4) {
-            let akce = p.akce;
-            self.radek(Self::fa(p.ikona), p.nazev, p.popis, Rc::new(move |_| akce()));
+        for p in commands.into_iter().take(4) {
+            let action = p.action;
+            self.row(Self::fa(p.icon), p.name, p.description, Rc::new(move |_| action()));
         }
 
-        // soubory: naposledy otevřené a z domovské složky
-        let mut soubory: Vec<PathBuf> = Vec::new();
+        // files: recently opened and from the home folder
+        let mut files: Vec<PathBuf> = Vec::new();
         if d.chars().count() >= 2 {
             let nedavne = gtk::RecentManager::default().items();
             for i in nedavne.iter().take(300) {
@@ -585,67 +585,67 @@ impl Spotlight {
                 if !uri.starts_with("file://") {
                     continue;
                 }
-                let jmeno = normalizovat(&i.display_name());
-                if d.split_whitespace().all(|s| jmeno.contains(s)) {
+                let name = normalize(&i.display_name());
+                if d.split_whitespace().all(|s| name.contains(s)) {
                     if let Some(p) = gio::File::for_uri(&uri).path().filter(|p| p.exists()) {
-                        if !soubory.contains(&p) {
-                            soubory.push(p);
+                        if !files.contains(&p) {
+                            files.push(p);
                         }
                     }
                 }
-                if soubory.len() >= 3 {
+                if files.len() >= 3 {
                     break;
                 }
             }
-            let (pro_dotaz, nalezene) = &*self.soubory.borrow();
-            if *pro_dotaz == dotaz {
-                for p in nalezene {
-                    if !soubory.contains(p) {
-                        soubory.push(p.clone());
+            let (pro_query, found) = &*self.files.borrow();
+            if *pro_query == query {
+                for p in found {
+                    if !files.contains(p) {
+                        files.push(p.clone());
                     }
                 }
             }
         }
-        if !soubory.is_empty() {
-            self.nadpis("Files");
+        if !files.is_empty() {
+            self.title("Files");
         }
-        for p in soubory.into_iter().take(NEJVIC_SOUBORU) {
-            let nazev = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-            let slozka = p.parent().map(zkratit).unwrap_or_default();
+        for p in files.into_iter().take(MAX_FILES) {
+            let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let folder = p.parent().map(shorten).unwrap_or_default();
             let p2 = p.clone();
-            self.radek(ikona_souboru(&p).upcast(), &nazev, &format!("{slozka} · Ctrl+Enter shows it in the folder"), Rc::new(move |ctrl| {
+            self.row(icon_files(&p).upcast(), &name, &format!("{folder} · Ctrl+Enter shows it in the folder"), Rc::new(move |ctrl| {
                 if ctrl {
-                    ukazat_ve_slozce(&p2)
+                    show_ve_folder(&p2)
                 } else {
-                    otevrit(&p2)
+                    open(&p2)
                 }
             }));
         }
 
         // web
-        self.nadpis("Web");
-        let d2 = dotaz.clone();
-        self.radek(Self::fa("\u{f0ac}"), &format!("Search the web for “{dotaz}”"), "Firefox, default search engine", Rc::new(move |_| hledat_na_webu(&d2)));
+        self.title("Web");
+        let d2 = query.clone();
+        self.row(Self::fa("\u{f0ac}"), &format!("Search the web for “{query}”"), "Firefox, default search engine", Rc::new(move |_| search_on_web(&d2)));
 
-        self.posuv.set_visible(true);
-        if let Some((r, _)) = self.radky.borrow().first() {
-            self.seznam.select_row(Some(r));
+        self.scroll.set_visible(true);
+        if let Some((r, _)) = self.rows.borrow().first() {
+            self.list.select_row(Some(r));
         }
-        self.posuv.vadjustment().set_value(0.0);
+        self.scroll.vadjustment().set_value(0.0);
     }
 
-    fn posunout(&self, krok: i32) {
-        let radky = self.radky.borrow();
-        if radky.is_empty() {
+    fn move_(&self, step: i32) {
+        let rows = self.rows.borrow();
+        if rows.is_empty() {
             return;
         }
-        let ted = self.seznam.selected_row().and_then(|v| radky.iter().position(|(r, _)| *r == v)).unwrap_or(0) as i32;
-        let novy = (ted + krok).rem_euclid(radky.len() as i32) as usize;
-        let r = &radky[novy].0;
-        self.seznam.select_row(Some(r));
-        // ať je vybraný řádek vidět
-        if let Some(b) = r.compute_bounds(&self.seznam) {
-            let adj = self.posuv.vadjustment();
+        let now = self.list.selected_row().and_then(|v| rows.iter().position(|(r, _)| *r == v)).unwrap_or(0) as i32;
+        let new = (now + step).rem_euclid(rows.len() as i32) as usize;
+        let r = &rows[new].0;
+        self.list.select_row(Some(r));
+        // keep the selected row visible
+        if let Some(b) = r.compute_bounds(&self.list) {
+            let adj = self.scroll.vadjustment();
             let (y, v) = (b.y() as f64, b.height() as f64);
             if y < adj.value() {
                 adj.set_value(y - 30.0);
@@ -655,14 +655,14 @@ impl Spotlight {
         }
     }
 
-    fn spustit_vybrany(&self, ctrl: bool) {
-        let akce = {
-            let radky = self.radky.borrow();
-            let vybrany = self.seznam.selected_row();
-            vybrany.and_then(|v| radky.iter().find(|(r, _)| *r == v).map(|(_, a)| a.clone())).or_else(|| radky.first().map(|(_, a)| a.clone()))
+    fn start_selected(&self, ctrl: bool) {
+        let action = {
+            let rows = self.rows.borrow();
+            let selected = self.list.selected_row();
+            selected.and_then(|v| rows.iter().find(|(r, _)| *r == v).map(|(_, a)| a.clone())).or_else(|| rows.first().map(|(_, a)| a.clone()))
         };
-        if let Some(a) = akce {
-            schovat();
+        if let Some(a) = action {
+            hide();
             a(ctrl);
         }
     }

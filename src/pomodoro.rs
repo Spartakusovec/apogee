@@ -1,6 +1,6 @@
-//! Pomodoro: střídá práci a přestávku podle časů, které si nastavíš (pamatují se
-//! v ~/.config/apogee/settings.json, výchozí žádné nejsou). Panel odpočítává, na konci každé
-//! části přijde notifikace. Do Not Disturb nezapíná. Ovládá se v okénku notifikací.
+//! Pomodoro: alternates work and break with times you set (remembered
+//! in ~/.config/apogee/settings.json, there are no defaults). The bar counts down, at the end of each
+//! part a notification arrives. It doesn't turn on Do Not Disturb. Controlled in the notification popup.
 
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
@@ -8,126 +8,126 @@ use std::time::{Duration, Instant};
 use gtk::glib;
 use serde_json::json;
 
-use crate::panel::publikovat;
-use crate::spolecne::*;
+use crate::panel::publish;
+use crate::common::*;
 
 #[derive(Clone, Copy, PartialEq)]
-pub enum Faze {
-    Prace,
-    Prestavka,
+pub enum Phase {
+    Work,
+    Break,
 }
 
-struct Stav {
-    faze: Faze,
-    prace: Duration,
-    prestavka: Duration,
-    /// kdy část skončí (když běží)
-    konec: Instant,
-    /// kolik zbývalo při pozastavení
-    pozastaveno: Option<Duration>,
+struct State {
+    phase: Phase,
+    work: Duration,
+    break_time: Duration,
+    /// when the part ends (while running)
+    end: Instant,
+    /// how much was left when paused
+    paused: Option<Duration>,
 }
 
 thread_local! {
-    static STAV: RefCell<Option<Stav>> = const { RefCell::new(None) };
+    static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
 }
 
-/// Nastavené časy v minutách (práce, přestávka), když už je někdy nastavil.
-pub fn casy() -> Option<(u64, u64)> {
-    let v = nastaveni("pomodoro");
-    Some((v["prace"].as_u64().filter(|&m| m > 0)?, v["prestavka"].as_u64().filter(|&m| m > 0)?))
+/// The set times in minutes (work, break), if they were ever set.
+pub fn times() -> Option<(u64, u64)> {
+    let v = settings("pomodoro");
+    Some((v["work"].as_u64().filter(|&m| m > 0)?, v["break_time"].as_u64().filter(|&m| m > 0)?))
 }
 
-/// Co teď běží: část, kolik zbývá, jestli je pozastaveno.
-pub fn info() -> Option<(Faze, Duration, bool)> {
-    STAV.with(|s| {
-        s.borrow().as_ref().map(|s| match s.pozastaveno {
-            Some(zbyva) => (s.faze, zbyva, true),
-            None => (s.faze, s.konec.saturating_duration_since(Instant::now()), false),
+/// What runs now: part, time left, whether paused.
+pub fn info() -> Option<(Phase, Duration, bool)> {
+    STATE.with(|s| {
+        s.borrow().as_ref().map(|s| match s.paused {
+            Some(remaining) => (s.phase, remaining, true),
+            None => (s.phase, s.end.saturating_duration_since(Instant::now()), false),
         })
     })
 }
 
-pub fn spustit(prace: u64, prestavka: u64) {
-    ulozit_nastaveni("pomodoro", json!({"prace": prace, "prestavka": prestavka}));
-    let bezi = STAV.with(|s| s.borrow().is_some());
-    let (prace, prestavka) = (Duration::from_secs(60 * prace), Duration::from_secs(60 * prestavka));
-    STAV.with(|s| s.replace(Some(Stav { faze: Faze::Prace, prace, prestavka, konec: Instant::now() + prace, pozastaveno: None })));
-    if !bezi {
+pub fn start(work: u64, break_time: u64) {
+    save_settings("pomodoro", json!({"work": work, "break_time": break_time}));
+    let running = STATE.with(|s| s.borrow().is_some());
+    let (work, break_time) = (Duration::from_secs(60 * work), Duration::from_secs(60 * break_time));
+    STATE.with(|s| s.replace(Some(State { phase: Phase::Work, work, break_time, end: Instant::now() + work, paused: None })));
+    if !running {
         glib::timeout_add_local(Duration::from_millis(500), || {
-            if tik() {
+            if tick() {
                 glib::ControlFlow::Continue
             } else {
                 glib::ControlFlow::Break
             }
         });
     }
-    do_panelu();
+    to_panel();
 }
 
-pub fn pozastavit_nebo_pokracovat() {
-    STAV.with(|s| {
+pub fn pause_nebo_resume() {
+    STATE.with(|s| {
         if let Some(s) = s.borrow_mut().as_mut() {
-            match s.pozastaveno.take() {
-                Some(zbyva) => s.konec = Instant::now() + zbyva,
-                None => s.pozastaveno = Some(s.konec.saturating_duration_since(Instant::now())),
+            match s.paused.take() {
+                Some(remaining) => s.end = Instant::now() + remaining,
+                None => s.paused = Some(s.end.saturating_duration_since(Instant::now())),
             }
         }
     });
-    do_panelu();
+    to_panel();
 }
 
-pub fn zastavit() {
-    STAV.with(|s| s.replace(None));
-    do_panelu();
+pub fn stop() {
+    STATE.with(|s| s.replace(None));
+    to_panel();
 }
 
-/// Každou půlsekundu: konec části → další část a notifikace. false = pomodoro skončilo.
-fn tik() -> bool {
-    let dalsi = STAV.with(|s| {
+/// Every half second: end of a part → next part and a notification. false = the pomodoro ended.
+fn tick() -> bool {
+    let next = STATE.with(|s| {
         let mut s = s.borrow_mut();
         let s = s.as_mut()?;
-        if s.pozastaveno.is_some() || Instant::now() < s.konec {
+        if s.paused.is_some() || Instant::now() < s.end {
             return None;
         }
-        s.faze = if s.faze == Faze::Prace { Faze::Prestavka } else { Faze::Prace };
-        let delka = if s.faze == Faze::Prace { s.prace } else { s.prestavka };
-        s.konec = Instant::now() + delka;
-        Some((s.faze, delka.as_secs() / 60))
+        s.phase = if s.phase == Phase::Work { Phase::Break } else { Phase::Work };
+        let length = if s.phase == Phase::Work { s.work } else { s.break_time };
+        s.end = Instant::now() + length;
+        Some((s.phase, length.as_secs() / 60))
     });
-    if let Some((faze, minuty)) = dalsi {
-        let (nadpis, text) = match faze {
-            Faze::Prestavka => ("Time for a break".to_string(), format!("Work session done. Break: {minuty} min.")),
-            Faze::Prace => ("Break is over".to_string(), format!("Back to work: {minuty} min.")),
+    if let Some((phase, minutes)) = next {
+        let (title, text) = match phase {
+            Phase::Break => ("Time for a break".to_string(), format!("Work session done. Break: {minutes} min.")),
+            Phase::Work => ("Break is over".to_string(), format!("Back to work: {minutes} min.")),
         };
-        pozadi("notify-send", &["-i", "alarm-symbolic", &nadpis, &text]);
+        background("notify-send", &["-i", "alarm-symbolic", &title, &text]);
     }
-    do_panelu();
-    STAV.with(|s| s.borrow().is_some())
+    to_panel();
+    STATE.with(|s| s.borrow().is_some())
 }
 
-pub fn odpocet(d: Duration) -> String {
+pub fn countdown(d: Duration) -> String {
     let s = d.as_secs() + u64::from(d.subsec_nanos() > 0);
     format!("{}:{:02}", s / 60, s % 60)
 }
 
-/// Panel: odpočet, jen když pomodoro běží (klik = okénko notifikací s ovládáním).
-fn do_panelu() {
+/// Bar: countdown, only while the pomodoro runs (click = notification popup with the controls).
+fn to_panel() {
     match info() {
-        Some((faze, zbyva, pozastaveno)) => {
-            let trida = if pozastaveno {
-                "pozastaveno"
-            } else if faze == Faze::Prace {
-                "prace"
+        Some((phase, remaining, paused)) => {
+            let class = if paused {
+                "paused"
+            } else if phase == Phase::Work {
+                "work"
             } else {
-                "prestavka"
+                "break_time"
             };
-            let ikona = if faze == Faze::Prace { "\u{f2f2}" } else { "\u{f0f4}" };
-            publikovat("pomodoro", json!({"text": format!("{ikona}  {}", odpocet(zbyva)), "class": trida}));
+            let icon = if phase == Phase::Work { "\u{f2f2}" } else { "\u{f0f4}" };
+            publish("pomodoro", json!({"text": format!("{icon}  {}", countdown(remaining)), "class": class}));
         }
-        None => publikovat("pomodoro", json!({"text": ""})),
+        None => publish("pomodoro", json!({"text": ""})),
     }
 }
 
-pub fn spustit_panel() {
-    do_panelu();
+pub fn start_panel() {
+    to_panel();
 }

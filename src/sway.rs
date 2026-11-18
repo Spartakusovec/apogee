@@ -1,5 +1,5 @@
-//! Komunikace se Swayem: pořadí naposledy použitých oken (pro Alt+Tab), seznam oken
-//! a moduly panelu, které závisí na Swayi (název aktivní aplikace, stav dlaždic).
+//! Talking to Sway: order of the most recently used windows (for Alt+Tab), window list
+//! and bar modules that depend on Sway (name of the active app, tiling state).
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -7,387 +7,387 @@ use std::time::Duration;
 use serde_json::json;
 use swayipc::{Connection, Event, EventType, Node, NodeType, WindowChange};
 
-use crate::panel::{escapovat, publikovat};
+use crate::panel::{escape, publish};
 
-/// ID oken od naposledy použitého
-static PORADI: Mutex<Vec<i64>> = Mutex::new(Vec::new());
+/// window IDs, most recently used first
+static ORDER: Mutex<Vec<i64>> = Mutex::new(Vec::new());
 
-/// Aplikace, jejichž nová okna zůstanou plovoucí i na ploše s dlaždicemi (dialogy, malá okna)
-const VZDY_PLOVOUCI: [&str; 5] = ["pavucontrol", "blueman", "nm-connection-editor", "Calculator", "lxpolkit"];
+/// Apps whose new windows stay floating even on a tiled workspace (dialogs, small windows)
+const ALWAYS_FLOATING: [&str; 5] = ["pavucontrol", "blueman", "nm-connection-editor", "Calculator", "lxpolkit"];
 
-/// Na pozadí sleduje okna a plochy: pořadí oken, moduly panelu a nová okna na plochách
-/// s dlaždicemi (místo skriptů aktivni-apps.sh, dlazdice-stav.sh a dlazdice-nova-okna.sh).
-pub fn sledovat() {
+/// Watches windows and workspaces in the background: window order, bar modules and new windows on
+/// tiled workspaces (replaced several shell scripts).
+pub fn watch() {
     std::thread::spawn(|| loop {
-        let udalosti = Connection::new().and_then(|c| c.subscribe([EventType::Window, EventType::Workspace, EventType::Tick, EventType::Mode, EventType::Input]));
-        if let (Ok(udalosti), Ok(mut sway)) = (udalosti, Connection::new()) {
-            aplikace_do_panelu(&mut sway);
-            dlazdice_do_panelu(&mut sway);
-            plochy_do_panelu(&mut sway);
-            rozlozeni_do_panelu(&mut sway);
-            publikovat("rezim", json!({"text": ""}));
-            for udalost in udalosti.flatten() {
-                match udalost {
+        let events = Connection::new().and_then(|c| c.subscribe([EventType::Window, EventType::Workspace, EventType::Tick, EventType::Mode, EventType::Input]));
+        if let (Ok(events), Ok(mut sway)) = (events, Connection::new()) {
+            apps_to_panel(&mut sway);
+            tiling_to_panel(&mut sway);
+            workspaces_to_panel(&mut sway);
+            layouts_to_panel(&mut sway);
+            publish("mode", json!({"text": ""}));
+            for event in events.flatten() {
+                match event {
                     Event::Window(w) => {
                         match w.change {
                             WindowChange::Focus => {
-                                let mut poradi = PORADI.lock().unwrap();
-                                poradi.retain(|&id| id != w.container.id);
-                                poradi.insert(0, w.container.id);
+                                let mut order = ORDER.lock().unwrap();
+                                order.retain(|&id| id != w.container.id);
+                                order.insert(0, w.container.id);
                             }
-                            WindowChange::Close => PORADI.lock().unwrap().retain(|&id| id != w.container.id),
-                            WindowChange::New => nove_okno(&mut sway, &w.container),
-                            // titulky se mění pořád, název aplikace ne
+                            WindowChange::Close => ORDER.lock().unwrap().retain(|&id| id != w.container.id),
+                            WindowChange::New => new_window(&mut sway, &w.container),
+                            // titles change all the time, the app name doesn't
                             WindowChange::Title | WindowChange::Mark | WindowChange::Urgent => continue,
                             _ => {}
                         }
-                        aplikace_do_panelu(&mut sway);
-                        // ikony aplikací u ploch (focus jen přepíná aktivní plochu, ta má vlastní událost)
+                        apps_to_panel(&mut sway);
+                        // app icons next to the workspaces (focus only switches the active workspace, which has its own event)
                         if matches!(w.change, WindowChange::New | WindowChange::Close | WindowChange::Move) {
-                            plochy_do_panelu(&mut sway);
+                            workspaces_to_panel(&mut sway);
                         }
-                        crate::dok::upozornit();
+                        crate::dock::notify();
                     }
-                    // přepnuté rozložení klávesnice (nebo nové z Settings)
-                    Event::Input(i) if matches!(i.change, swayipc::InputChange::XkbLayout | swayipc::InputChange::XkbKeymap) => rozlozeni_do_panelu(&mut sway),
+                    // keyboard layout switched (or a new one from Settings)
+                    Event::Input(i) if matches!(i.change, swayipc::InputChange::XkbLayout | swayipc::InputChange::XkbKeymap) => layouts_to_panel(&mut sway),
                     Event::Mode(m) => {
-                        // režim Swaye (resize): vidět, jen když není výchozí
-                        let text = if m.change == "default" { String::new() } else { escapovat(&m.change) };
-                        publikovat("rezim", json!({"text": text}));
+                        // Sway mode (resize): visible only when it isn't the default
+                        let text = if m.change == "default" { String::new() } else { escape(&m.change) };
+                        publish("mode", json!({"text": text}));
                     }
                     Event::Workspace(_) => {
-                        crate::dok::upozornit();
-                        plochy_do_panelu(&mut sway);
-                        aplikace_do_panelu(&mut sway);
-                        dlazdice_do_panelu(&mut sway);
+                        crate::dock::notify();
+                        workspaces_to_panel(&mut sway);
+                        apps_to_panel(&mut sway);
+                        tiling_to_panel(&mut sway);
                     }
-                    // tlačítko dlaždic přepnulo režim plochy (prepnout_dlazdice)
-                    Event::Tick(t) if t.payload == "dlazdice" => dlazdice_do_panelu(&mut sway),
-                    // pravý klik na lištu aplikace (GTK): upravený Sway pošle „window-menu“
-                    // okno se táhne (upravený Sway, nejvýš 10× za sekundu): dok se podívá, jestli překáží
-                    Event::Tick(t) if t.payload == "window-drag" => crate::dok::upozornit(),
+                    // the tiling button switched the workspace mode (toggle_tiling)
+                    Event::Tick(t) if t.payload == "tiling" => tiling_to_panel(&mut sway),
+                    // right click on an app's title bar (GTK): the patched Sway sends “window-menu”
+                    // a window is being dragged (patched Sway, at most 10× a second): the dock checks whether it's in the way
+                    Event::Tick(t) if t.payload == "window-drag" => crate::dock::notify(),
                     Event::Tick(t) if t.payload == "window-menu" => {
-                        gtk::glib::MainContext::default().invoke(|| crate::okenka::prepnout("okno"));
+                        gtk::glib::MainContext::default().invoke(|| crate::popups::toggle("window"));
                     }
                     _ => {}
                 }
             }
         }
-        // Sway se restartoval nebo spojení spadlo: zkusit znovu
+        // Sway restarted or the connection dropped: try again
         std::thread::sleep(Duration::from_secs(1));
     });
 }
 
-/// Rozložení klávesnice v panelu (jen když je jich víc): zkratka aktivního, třeba „CZ“, „US“.
-fn rozlozeni_do_panelu(sway: &mut Connection) {
-    let Ok(vstupy) = sway.get_inputs() else { return };
-    let Some(k) = vstupy.iter().find(|i| i.input_type == "keyboard" && i.xkb_layout_names.len() > 1) else {
-        publikovat("rozlozeni", json!({"text": ""}));
+/// Keyboard layout in the bar (only with more than one): the active one's code, e.g. “CZ”, “US”.
+fn layouts_to_panel(sway: &mut Connection) {
+    let Ok(inputs) = sway.get_inputs() else { return };
+    let Some(k) = inputs.iter().find(|i| i.input_type == "keyboard" && i.xkb_layout_names.len() > 1) else {
+        publish("layouts", json!({"text": ""}));
         return;
     };
     let i = k.xkb_active_layout_index.unwrap_or(0).max(0) as usize;
-    let kody = crate::spolecne::nastaveni("rozlozeni");
-    let kod = kody[i][0].as_str().map(|s| s.to_uppercase()).unwrap_or_else(|| k.xkb_layout_names.get(i).map(|n| n.chars().take(2).collect::<String>().to_uppercase()).unwrap_or_default());
-    let nazev = k.xkb_layout_names.get(i).cloned().unwrap_or_default();
-    publikovat("rozlozeni", json!({"text": format!("\u{f11c}  {kod}"), "tooltip": escapovat(&nazev)}));
+    let codes = crate::common::settings("layouts");
+    let code = codes[i][0].as_str().map(|s| s.to_uppercase()).unwrap_or_else(|| k.xkb_layout_names.get(i).map(|n| n.chars().take(2).collect::<String>().to_uppercase()).unwrap_or_default());
+    let name = k.xkb_layout_names.get(i).cloned().unwrap_or_default();
+    publish("layouts", json!({"text": format!("\u{f11c}  {code}"), "tooltip": escape(&name)}));
 }
 
-fn app_id(uzel: &Node) -> String {
-    uzel.app_id
+fn app_id(node: &Node) -> String {
+    node.app_id
         .clone()
-        .or_else(|| uzel.window_properties.as_ref().and_then(|w| w.class.clone()))
+        .or_else(|| node.window_properties.as_ref().and_then(|w| w.class.clone()))
         .unwrap_or_default()
 }
 
-fn najit<'a>(uzel: &'a Node, podminka: &dyn Fn(&Node) -> bool) -> Option<&'a Node> {
-    if podminka(uzel) {
-        return Some(uzel);
+fn find<'a>(node: &'a Node, condition: &dyn Fn(&Node) -> bool) -> Option<&'a Node> {
+    if condition(node) {
+        return Some(node);
     }
-    uzel.nodes.iter().chain(uzel.floating_nodes.iter()).find_map(|d| najit(d, podminka))
+    node.nodes.iter().chain(node.floating_nodes.iter()).find_map(|d| find(d, condition))
 }
 
-/// Název aktivní aplikace vlevo v panelu, jako na Macu (klik = nabídka okna).
-/// Na prázdné ploše se schová.
-fn aplikace_do_panelu(sway: &mut Connection) {
+/// Name of the active app at the left of the bar, like on a Mac (click = window menu).
+/// Hidden on an empty workspace.
+fn apps_to_panel(sway: &mut Connection) {
     let Ok(strom) = sway.get_tree() else { return };
-    match najit(&strom, &|n| n.focused && n.pid.is_some()) {
-        Some(okno) => {
-            let jmeno = crate::aplikace::info(&app_id(okno)).jmeno;
-            publikovat(
-                "aplikace",
+    match find(&strom, &|n| n.focused && n.pid.is_some()) {
+        Some(window) => {
+            let name = crate::apps::info(&app_id(window)).name;
+            publish(
+                "apps",
                 json!({
-                    "text": format!("{}  <span size=\"smaller\" alpha=\"55%\">\u{f078}</span>", escapovat(&jmeno)),
+                    "text": format!("{}  <span size=\"smaller\" alpha=\"55%\">\u{f078}</span>", escape(&name)),
                 }),
             );
         }
-        None => publikovat("aplikace", json!({"text": ""})),
+        None => publish("apps", json!({"text": ""})),
     }
 }
 
-/// Ikona aplikace u čísla plochy v panelu (Font Awesome)
-fn ikona_na_plose(app: &str) -> &'static str {
+/// App icon next to the workspace number in the bar (Font Awesome)
+fn icon_on_workspace(app: &str) -> &'static str {
     let a = app.to_lowercase();
-    let je = |slova: &[&str]| slova.iter().any(|s| a.contains(s));
-    if je(&["firefox"]) {
+    let is = |words: &[&str]| words.iter().any(|s| a.contains(s));
+    if is(&["firefox"]) {
         "\u{f269}"
-    } else if je(&["brave", "chrom"]) {
+    } else if is(&["brave", "chrom"]) {
         "\u{f268}"
-    } else if je(&["discord", "vesktop"]) {
+    } else if is(&["discord", "vesktop"]) {
         "\u{f392}"
-    } else if je(&["spotify"]) {
+    } else if is(&["spotify"]) {
         "\u{f1bc}"
-    } else if je(&["telegram"]) {
+    } else if is(&["telegram"]) {
         "\u{f2c6}"
-    } else if je(&["stremio", "vlc", "player", "mpv", "celluloid"]) {
+    } else if is(&["stremio", "vlc", "player", "mpv", "celluloid"]) {
         "\u{f008}"
-    } else if je(&["ptyxis", "terminal", "kitty", "alacritty", "foot"]) {
+    } else if is(&["ptyxis", "terminal", "kitty", "alacritty", "foot"]) {
         "\u{f120}"
-    } else if je(&["nautilus", "cosmic-files", "files"]) {
+    } else if is(&["nautilus", "cosmic-files", "files"]) {
         "\u{f07b}"
-    } else if je(&["obsidian"]) {
+    } else if is(&["obsidian"]) {
         "\u{f249}"
-    } else if je(&["code", "zed"]) {
+    } else if is(&["code", "zed"]) {
         "\u{f121}"
-    } else if je(&["onlyoffice", "papers", "inkscape", "gimp", "libreoffice"]) {
+    } else if is(&["onlyoffice", "papers", "inkscape", "gimp", "libreoffice"]) {
         "\u{f15b}"
-    } else if je(&["minecraft"]) {
+    } else if is(&["minecraft"]) {
         "\u{f11b}"
-    } else if je(&["anki"]) {
+    } else if is(&["anki"]) {
         "\u{f02d}"
     } else {
         "\u{f2d0}"
     }
 }
 
-/// Plochy, jak jsou v panelu: 1–4 vždycky, další jen když existují, seřazené podle čísla.
-fn jmena_ploch(plochy: &[swayipc::Workspace]) -> Vec<String> {
-    let mut jmena: Vec<String> = (1..=4).map(|n| n.to_string()).collect();
-    for p in plochy {
-        if !jmena.contains(&p.name) {
-            jmena.push(p.name.clone());
+/// Workspaces as in the bar: 1–4 always, others only when they exist, sorted by number.
+fn names_ploch(workspaces: &[swayipc::Workspace]) -> Vec<String> {
+    let mut names: Vec<String> = (1..=4).map(|n| n.to_string()).collect();
+    for p in workspaces {
+        if !names.contains(&p.name) {
+            names.push(p.name.clone());
         }
     }
-    let poradi = |j: &str| j.parse::<i64>().unwrap_or(i64::MAX);
-    jmena.sort_by_key(|j| (poradi(j), j.clone()));
-    jmena
+    let order = |j: &str| j.parse::<i64>().unwrap_or(i64::MAX);
+    names.sort_by_key(|j| (order(j), j.clone()));
+    names
 }
 
-/// Kolečko nad plochami: sousední plocha z panelu (i prázdná 1–4), bez přetočení dokola.
-/// (`workspace next` Swaye zná jen existující plochy, s jedinou otevřenou by nedělal nic.)
-pub fn plocha_vedle(dalsi: bool) {
+/// Scrolling over the workspaces: the neighbouring workspace in the bar (empty 1–4 too), no wrapping around.
+/// (Sway's `workspace next` only knows existing workspaces, with a single one open it would do nothing.)
+pub fn workspace_next_to(next: bool) {
     let Ok(mut sway) = Connection::new() else { return };
-    let Ok(plochy) = sway.get_workspaces() else { return };
-    let Some(ted) = plochy.iter().find(|p| p.focused) else { return };
-    let jmena = jmena_ploch(&plochy);
-    let Some(i) = jmena.iter().position(|j| *j == ted.name) else { return };
-    let cil = if dalsi { jmena.get(i + 1) } else { i.checked_sub(1).and_then(|i| jmena.get(i)) };
-    if let Some(cil) = cil {
-        let _ = sway.run_command(format!("workspace \"{}\"", cil.replace('"', "\\\"")));
+    let Ok(workspaces) = sway.get_workspaces() else { return };
+    let Some(now) = workspaces.iter().find(|p| p.focused) else { return };
+    let names = names_ploch(&workspaces);
+    let Some(i) = names.iter().position(|j| *j == now.name) else { return };
+    let target = if next { names.get(i + 1) } else { i.checked_sub(1).and_then(|i| names.get(i)) };
+    if let Some(target) = target {
+        let _ = sway.run_command(format!("workspace \"{}\"", target.replace('"', "\\\"")));
     }
 }
 
-/// Plochy v panelu: 1–4 vždycky, další jen když existují; u každé ikony jejích oken.
-fn plochy_do_panelu(sway: &mut Connection) {
-    let (Ok(strom), Ok(plochy)) = (sway.get_tree(), sway.get_workspaces()) else { return };
-    let mut uzly: Vec<&Node> = Vec::new();
-    fn najdi<'a>(n: &'a Node, v: &mut Vec<&'a Node>) {
+/// Workspaces in the bar: 1–4 always, others only when they exist; each with the icons of its windows.
+fn workspaces_to_panel(sway: &mut Connection) {
+    let (Ok(strom), Ok(workspaces)) = (sway.get_tree(), sway.get_workspaces()) else { return };
+    let mut nodes: Vec<&Node> = Vec::new();
+    fn find<'a>(n: &'a Node, v: &mut Vec<&'a Node>) {
         if n.node_type == NodeType::Workspace {
             v.push(n);
             return;
         }
         for d in &n.nodes {
-            najdi(d, v);
+            find(d, v);
         }
     }
-    najdi(&strom, &mut uzly);
-    let mut seznam: Vec<serde_json::Value> = Vec::new();
-    for jmeno in jmena_ploch(&plochy) {
-        let p = plochy.iter().find(|p| p.name == jmeno);
-        let mut ikony: Vec<&str> = Vec::new();
-        if let Some(uzel) = uzly.iter().find(|u| u.name.as_deref() == Some(jmeno.as_str())) {
-            fn okna<'a>(n: &'a Node, v: &mut Vec<String>) {
+    find(&strom, &mut nodes);
+    let mut list: Vec<serde_json::Value> = Vec::new();
+    for name in names_ploch(&workspaces) {
+        let p = workspaces.iter().find(|p| p.name == name);
+        let mut icons: Vec<&str> = Vec::new();
+        if let Some(node) = nodes.iter().find(|u| u.name.as_deref() == Some(name.as_str())) {
+            fn windows<'a>(n: &'a Node, v: &mut Vec<String>) {
                 if n.pid.is_some() {
                     v.push(n.app_id.clone().or_else(|| n.window_properties.as_ref().and_then(|w| w.class.clone())).unwrap_or_default());
                 }
                 for d in n.nodes.iter().chain(n.floating_nodes.iter()) {
-                    okna(d, v);
+                    windows(d, v);
                 }
             }
             let mut v = Vec::new();
-            okna(uzel, &mut v);
-            ikony = v.iter().map(|a| ikona_na_plose(a)).collect();
+            windows(node, &mut v);
+            icons = v.iter().map(|a| icon_on_workspace(a)).collect();
         }
-        seznam.push(json!({
-            "jmeno": jmeno,
-            "ikony": ikony.join(" "),
-            "aktivni": p.is_some_and(|p| p.focused),
-            "videt": p.is_some_and(|p| p.visible),
-            "nalehava": p.is_some_and(|p| p.urgent),
-            "prazdna": ikony.is_empty(),
+        list.push(json!({
+            "name": name,
+            "icons": icons.join(" "),
+            "active": p.is_some_and(|p| p.focused),
+            "visible": p.is_some_and(|p| p.visible),
+            "urgent": p.is_some_and(|p| p.urgent),
+            "empty": icons.is_empty(),
         }));
     }
-    publikovat("plochy", json!({"plochy": seznam}));
+    publish("workspaces", json!({"workspaces": list}));
 }
 
-/// Nové plochy v dlaždicích (Settings → Windows & Workspaces), jinak plovoucí okna.
-pub fn vychozi_dlazdice() -> bool {
-    crate::spolecne::nastaveni("dlazdice_vychozi").as_bool().unwrap_or(false)
+/// New workspaces tiled (Settings → Windows & Workspaces), otherwise floating windows.
+pub fn default_tiling() -> bool {
+    crate::common::settings("tiling_default").as_bool().unwrap_or(false)
 }
 
-/// Plocha je v dlaždicích: výchozí stav, pokud ji uživatel tlačítkem v panelu nepřepnul
-/// (výjimka je značka v run_dir: sway-dlazdice-N, nebo sway-plovouci-N při výchozích dlaždicích).
-fn plocha_dlazdice(plocha: &str) -> bool {
-    let d = crate::spolecne::run_dir();
-    if vychozi_dlazdice() {
-        !d.join(format!("sway-plovouci-{plocha}")).exists()
+/// The workspace is tiled: the default, unless the user switched it with the bar button
+/// (the exception is a marker in run_dir: sway-tiling-N, or sway-floating-N when tiling is the default).
+fn workspace_tiling(workspace: &str) -> bool {
+    let d = crate::common::run_dir();
+    if default_tiling() {
+        !d.join(format!("sway-floating-{workspace}")).exists()
     } else {
-        d.join(format!("sway-dlazdice-{plocha}")).exists()
+        d.join(format!("sway-tiling-{workspace}")).exists()
     }
 }
 
-fn zapsat_dlazdice(plocha: &str, dlazdice: bool) {
-    let d = crate::spolecne::run_dir();
-    let (vyjimka, zapnout) = if vychozi_dlazdice() { (format!("sway-plovouci-{plocha}"), !dlazdice) } else { (format!("sway-dlazdice-{plocha}"), dlazdice) };
-    if zapnout {
-        let _ = std::fs::write(d.join(vyjimka), "");
+fn write_tiling(workspace: &str, tiling: bool) {
+    let d = crate::common::run_dir();
+    let (exception, enable) = if default_tiling() { (format!("sway-floating-{workspace}"), !tiling) } else { (format!("sway-tiling-{workspace}"), tiling) };
+    if enable {
+        let _ = std::fs::write(d.join(exception), "");
     } else {
-        let _ = std::fs::remove_file(d.join(vyjimka));
+        let _ = std::fs::remove_file(d.join(exception));
     }
 }
 
-/// Tlačítko dlaždic v panelu: dlaždice = zvýrazněná mřížka, plovoucí okna = ztlumená ikona.
-fn dlazdice_do_panelu(sway: &mut Connection) {
-    let Ok(plochy) = sway.get_workspaces() else { return };
-    let Some(plocha) = plochy.iter().find(|p| p.focused) else { return };
-    let p = &plocha.name;
-    publikovat(
-        "dlazdice",
-        if plocha_dlazdice(p) {
-            json!({"text": "\u{f009}", "class": "dlazdice", "tooltip": format!("Workspace {p}: tiled\nClick: floating windows")})
+/// The tiling button in the bar: tiling = highlighted grid, floating windows = dimmed icon.
+fn tiling_to_panel(sway: &mut Connection) {
+    let Ok(workspaces) = sway.get_workspaces() else { return };
+    let Some(workspace) = workspaces.iter().find(|p| p.focused) else { return };
+    let p = &workspace.name;
+    publish(
+        "tiling",
+        if workspace_tiling(p) {
+            json!({"text": "\u{f009}", "class": "tiling", "tooltip": format!("Workspace {p}: tiled\nClick: floating windows")})
         } else {
-            json!({"text": "\u{f24d}", "class": "plovouci", "tooltip": format!("Workspace {p}: floating windows\nClick: tile them")})
+            json!({"text": "\u{f24d}", "class": "floating", "tooltip": format!("Workspace {p}: floating windows\nClick: tile them")})
         },
     );
 }
 
-/// Nové okno na ploše v režimu dlaždic se taky zařadí do dlaždic. Výjimky: dialogy a malá okna
-/// a druhé okno stejné aplikace (obvykle dialog, třeba výběr souboru) zůstanou plovoucí.
-fn nove_okno(sway: &mut Connection, okno: &Node) {
+/// A new window on a tiled workspace is tiled too. Exceptions: dialogs and small windows
+/// and a second window of the same app (usually a dialog, e.g. a file chooser) stay floating.
+fn new_window(sway: &mut Connection, window: &Node) {
     let Ok(strom) = sway.get_tree() else { return };
-    let Some(plocha) = najit(&strom, &|n| n.node_type == NodeType::Workspace && najit(n, &|d| d.id == okno.id).is_some()) else {
+    let Some(workspace) = find(&strom, &|n| n.node_type == NodeType::Workspace && find(n, &|d| d.id == window.id).is_some()) else {
         return;
     };
-    if !plocha_dlazdice(plocha.name.as_deref().unwrap_or("")) {
+    if !workspace_tiling(workspace.name.as_deref().unwrap_or("")) {
         return;
     }
-    let app = app_id(okno);
-    let role = okno.window_properties.as_ref().and_then(|w| w.window_role.clone()).unwrap_or_default();
-    let titulek = okno.name.as_deref().unwrap_or("");
-    if VZDY_PLOVOUCI.iter().any(|v| app.contains(v))
+    let app = app_id(window);
+    let role = window.window_properties.as_ref().and_then(|w| w.window_role.clone()).unwrap_or_default();
+    let title = window.name.as_deref().unwrap_or("");
+    if ALWAYS_FLOATING.iter().any(|v| app.contains(v))
         || role == "pop-up"
         || role == "dialog"
-        || titulek == "Picture-in-Picture"
-        || titulek == "Obraz v obraze"
+        || title == "Picture-in-Picture"
+        || title == "Obraz v obraze"
     {
         return;
     }
-    if najit(plocha, &|n| n.pid.is_some() && n.id != okno.id && app_id(n) == app).is_some() {
+    if find(workspace, &|n| n.pid.is_some() && n.id != window.id && app_id(n) == app).is_some() {
         return;
     }
-    let _ = sway.run_command(format!("[con_id={}] floating disable", okno.id));
+    let _ = sway.run_command(format!("[con_id={}] floating disable", window.id));
 }
 
-/// ID oken od naposledy použitého (pro dok: které okno aplikace přepnout).
-pub fn poradi() -> Vec<i64> {
-    PORADI.lock().unwrap().clone()
+/// Window IDs, most recently used first (for the dock: which of the app's windows to switch to).
+pub fn order() -> Vec<i64> {
+    ORDER.lock().unwrap().clone()
 }
 
-pub struct Okno {
+pub struct Window {
     pub id: i64,
     pub app: String,
-    pub titulek: String,
-    pub plocha: String,
-    pub aktivni: bool,
+    pub title: String,
+    pub workspace: String,
+    pub active: bool,
 }
 
-/// Okna ze všech ploch: aktivní první, pak podle posledního použití.
-pub fn okna() -> Vec<Okno> {
+/// Windows from all workspaces: the active one first, then by last use.
+pub fn windows() -> Vec<Window> {
     let Ok(strom) = Connection::new().and_then(|mut c| c.get_tree()) else {
         return Vec::new();
     };
-    let mut vysledek = Vec::new();
-    fn projdi(uzel: &Node, plocha: &str, vysledek: &mut Vec<Okno>) {
-        let plocha = if uzel.node_type == NodeType::Workspace {
-            // minimalizovaná okna (scratchpad): Alt+Tab je vrátí na jejich plochu
-            if uzel.name.as_deref() == Some("__i3_scratch") {
+    let mut result = Vec::new();
+    fn walk(node: &Node, workspace: &str, result: &mut Vec<Window>) {
+        let workspace = if node.node_type == NodeType::Workspace {
+            // minimized windows (scratchpad): Alt+Tab brings them back to their workspace
+            if node.name.as_deref() == Some("__i3_scratch") {
                 "minimized".to_string()
             } else {
-                uzel.name.clone().unwrap_or_default()
+                node.name.clone().unwrap_or_default()
             }
         } else {
-            plocha.to_string()
+            workspace.to_string()
         };
-        if uzel.pid.is_some() && matches!(uzel.node_type, NodeType::Con | NodeType::FloatingCon) {
-            vysledek.push(Okno {
-                id: uzel.id,
-                app: uzel
+        if node.pid.is_some() && matches!(node.node_type, NodeType::Con | NodeType::FloatingCon) {
+            result.push(Window {
+                id: node.id,
+                app: node
                     .app_id
                     .clone()
-                    .or_else(|| uzel.window_properties.as_ref().and_then(|w| w.class.clone()))
+                    .or_else(|| node.window_properties.as_ref().and_then(|w| w.class.clone()))
                     .unwrap_or_else(|| "?".into()),
-                titulek: uzel.name.clone().unwrap_or_default(),
-                plocha: plocha.clone(),
-                aktivni: uzel.focused,
+                title: node.name.clone().unwrap_or_default(),
+                workspace: workspace.clone(),
+                active: node.focused,
             });
         }
-        for dite in uzel.nodes.iter().chain(uzel.floating_nodes.iter()) {
-            projdi(dite, &plocha, vysledek);
+        for dite in node.nodes.iter().chain(node.floating_nodes.iter()) {
+            walk(dite, &workspace, result);
         }
     }
-    projdi(&strom, "", &mut vysledek);
-    let poradi = PORADI.lock().unwrap().clone();
-    vysledek.sort_by_key(|o| (!o.aktivni, poradi.iter().position(|&id| id == o.id).unwrap_or(usize::MAX)));
-    vysledek
+    walk(&strom, "", &mut result);
+    let order = ORDER.lock().unwrap().clone();
+    result.sort_by_key(|o| (!o.active, order.iter().position(|&id| id == o.id).unwrap_or(usize::MAX)));
+    result
 }
 
-pub fn prikaz(prikaz: &str) {
+pub fn command(command: &str) {
     if let Ok(mut c) = Connection::new() {
-        let _ = c.run_command(prikaz);
+        let _ = c.run_command(command);
     }
 }
 
-/// Tlačítko dlaždic v panelu: celá aktuální plocha plovoucí okna ↔ dlaždice (nikdy namíchané).
-/// Režim plochy se pamatuje, nová okna se pak přidají ve stejném režimu. Dřív plocha-dlazdice.sh.
-/// Settings změnila výchozí režim: výjimky zrušit, aktuální plochy přepnout a panel obnovit.
-pub fn zmenit_vychozi_dlazdice(dlazdice: bool) {
-    crate::spolecne::ulozit_nastaveni("dlazdice_vychozi", json!(dlazdice));
-    if let Ok(d) = std::fs::read_dir(crate::spolecne::run_dir()) {
+/// The tiling button in the bar: the whole current workspace floating ↔ tiled (never mixed).
+/// The workspace mode is remembered, new windows are then added in the same mode.
+/// Settings changed the default mode: clear the exceptions, switch the current workspaces and refresh the bar.
+pub fn change_default_tiling(tiling: bool) {
+    crate::common::save_settings("tiling_default", json!(tiling));
+    if let Ok(d) = std::fs::read_dir(crate::common::run_dir()) {
         for e in d.flatten() {
             let n = e.file_name().to_string_lossy().to_string();
-            if n.starts_with("sway-dlazdice-") || n.starts_with("sway-plovouci-") {
+            if n.starts_with("sway-tiling-") || n.starts_with("sway-floating-") {
                 let _ = std::fs::remove_file(e.path());
             }
         }
     }
     let Ok(mut sway) = Connection::new() else { return };
-    let _ = sway.run_command(if dlazdice { "[floating] floating disable" } else { "[tiling] floating enable" });
-    let _ = sway.send_tick("dlazdice");
+    let _ = sway.run_command(if tiling { "[floating] floating disable" } else { "[tiling] floating enable" });
+    let _ = sway.send_tick("tiling");
 }
 
-pub fn prepnout_dlazdice() {
+pub fn toggle_tiling() {
     let Ok(mut sway) = Connection::new() else { return };
-    let Ok(plochy) = sway.get_workspaces() else { return };
-    let Some(plocha) = plochy.into_iter().find(|p| p.focused) else { return };
-    let n = plocha.name;
-    if plocha_dlazdice(&n) {
-        zapsat_dlazdice(&n, false);
+    let Ok(workspaces) = sway.get_workspaces() else { return };
+    let Some(workspace) = workspaces.into_iter().find(|p| p.focused) else { return };
+    let n = workspace.name;
+    if workspace_tiling(&n) {
+        write_tiling(&n, false);
         let _ = sway.run_command(format!("[workspace=\"^{n}$\" tiling] floating enable"));
-        crate::osd::ukazat("\u{f24d}", &format!("Workspace {n}: floating windows"), None);
+        crate::osd::show("\u{f24d}", &format!("Workspace {n}: floating windows"), None);
     } else {
-        zapsat_dlazdice(&n, true);
+        write_tiling(&n, true);
         let _ = sway.run_command(format!("[workspace=\"^{n}$\" floating] floating disable"));
-        crate::osd::ukazat("\u{f009}", &format!("Workspace {n}: tiled"), None);
+        crate::osd::show("\u{f009}", &format!("Workspace {n}: tiled"), None);
     }
-    // ať se tlačítko v panelu hned přebarví (sleduje to vlákno s událostmi Swaye)
-    let _ = sway.send_tick("dlazdice");
+    // so the bar button is recoloured at once (the Sway event thread watches for this)
+    let _ = sway.send_tick("tiling");
 }
