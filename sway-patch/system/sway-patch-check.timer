@@ -1,0 +1,8 @@
+[Unit]
+Description=Check shortly after boot that Sway has the window-actions patch
+
+[Timer]
+OnBootSec=3min
+
+[Install]
+WantedBy=timers.target

@@ -62,6 +62,7 @@ sudo dnf install rust cargo gtk4-devel gtk4-layer-shell-devel
 cargo build --release
 install -m755 target/release/apogee target/release/apogee-daemon ~/.local/bin/
 bash extras/install.sh        # theme generator, set-wallpaper and the Sway scripts (see below)
+sudo bash sway-patch/system/install.sh   # Fedora: Sway with title bar buttons (optional, see sway-patch/)
 ```
 
 In the Sway config (`extras/install.sh` prints the full list):
@@ -131,9 +132,10 @@ when the `ideapad_acpi` driver offers it.
 - `sway-scripts/`: `apogee-watch.sh`, `night-light.sh`, `idle.sh` (with `dim.sh` and
   `unless-playing.sh`), `power-mode.sh` and `icons.sh`.
 
-**Sway patch:** the author runs Sway with a patch (not published) that adds title bar buttons,
-maximize, snapping and minimize. With plain Sway everything else works (the smoke test checks
-this); only those commands are unavailable.
+**Sway patch:** the title bar buttons, maximize, edge snapping and minimize that make floating
+windows feel like GNOME or macOS come from a small Sway patch in [`sway-patch/`](sway-patch/)
+(for Sway 1.11; on Fedora it rebuilds itself after every Sway update). With plain Sway everything
+else works (the smoke test checks this); only those features are missing.
 
 Everything is in English. The only Czech words left are deliberate: search synonyms in Settings
 and Spotlight, and Czech unit names in the converter, so Czech queries work too.
@@ -155,6 +157,7 @@ and Spotlight, and Czech unit names in the converter, so Czech queries work too.
 | `src/music.rs`, `src/recording.rs`, `src/updates.rs`, `src/pomodoro.rs` | MPRIS, screenshots and recording, update checks, Pomodoro |
 | `src/migrate.rs` | one-time migration of settings from older versions |
 | `extras/` | theme generator, `set-wallpaper` and Sway scripts |
+| `sway-patch/` | the Sway patch for title bar buttons, maximize, snapping and minimize, with Fedora automation |
 | `tests/` | smoke test and virtual input tools |
 | `docs/settings-design.md` | design notes for the Settings app |
 

@@ -1,0 +1,9 @@
+[Unit]
+Description=Rebuild Sway with the window-actions patch if an update replaced it
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+Nice=10
+ExecStart=/usr/local/libexec/sway-patch

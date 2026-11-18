@@ -16,6 +16,7 @@ SRC=$(cd "$(dirname "$0")/.." && pwd)
 OUT=$SRC/tests/out
 DAEMON=$SRC/target/release/apogee-daemon
 SWAY=${SWAY:-sway}
+grep -qaF "close button: cairo" "$(command -v "$SWAY")" && PATCHED=1 || PATCHED=0
 failures=0
 ok() { echo "  ok    $1"; }
 fail() { echo "  FAIL $1"; failures=$((chyb + 1)); }
@@ -155,13 +156,49 @@ PY
     echo "  info  one screenshot takes $(( (t1 - t0) / 1000000 )) ms (the resolution of these numbers)"
 fi
 
+if [ "$PATCHED" = 1 ]; then
+    echo "== Title bar buttons (patched Sway)"
+    GTK_THEME=Adwaita python3 "$SRC/tests/tools/window.py" "Test window" >/dev/null 2>&1 &
+    WPID=$!
+    for _ in $(seq 30); do swaymsg -t get_tree | grep -q '"name": "Test window"' && break; sleep 0.2; done
+    sleep 1
+    swaymsg '[title="^Test window$"] floating enable, resize set 600 400, move position 300 200' >/dev/null; sleep 0.5
+    # window geometry and title bar height from the tree; buttons from the right: close, maximize, minimize
+    geo() { swaymsg -t get_tree | python3 -I -c '
+import json,sys
+def walk(n):
+    if n.get("name")=="Test window": r,d=n["rect"],n["deco_rect"]; print(r["x"],r["y"],r["width"],r["height"],d["height"]); sys.exit()
+    for c in n.get("nodes",[])+n.get("floating_nodes",[]): walk(c)
+walk(json.load(sys.stdin)); print("none")'; }
+    button() { # n-th button from the right (1 = close): click its centre
+        local bx by bw bh bd; read -r bx by bw bh bd <<< "$(geo)"
+        "$T/vpointer" $(( bx + bw - bd * $1 + bd / 2 )) $(( by - bd / 2 )) click; sleep 0.8; }
+    shot titlebar "$(geo | awk '{print $1","$2-$5" "$3"x"$5}')"
+    read -r x y w h d <<< "$(geo)"
+    button 2; read -r mx my mw mh md <<< "$(geo)"
+    [ "$mw" -gt "$w" ] && echo "  ok    maximize button (width $w → $mw)" || echo "  FAIL maximize button did nothing"
+    button 2; read -r rx ry rw rh rd <<< "$(geo)"
+    [ "$rw" = "$w" ] && echo "  ok    restore button (back to $rw)" || echo "  FAIL restore button (width $rw, expected $w)"
+    button 3; sleep 0.5
+    swaymsg -t get_tree | python3 -I -c '
+import json,sys
+def walk(n, scratch=False):
+    scratch = scratch or n.get("name")=="__i3_scratch"
+    if n.get("name")=="Test window": sys.exit(0 if scratch else 1)
+    for c in n.get("nodes",[])+n.get("floating_nodes",[]): walk(c, scratch)
+walk(json.load(sys.stdin)); sys.exit(1)' && echo "  ok    minimize button (window in the scratchpad)" || echo "  FAIL minimize button"
+    swaymsg '[title="^Test window$"] scratchpad show' >/dev/null; sleep 0.5
+    button 1; sleep 0.5
+    kill -0 $WPID 2>/dev/null && { echo "  FAIL close button"; kill $WPID; } || echo "  ok    close button"
+fi
+
 echo "== Health"
 if kill -0 "$HPID" 2>/dev/null; then echo "  ok    daemon still running"; else echo "  FAIL daemon is gone"; fi
 if grep -q panicked "$H/.cache/apogee/errors.log" 2>/dev/null; then echo "  FAIL panic in errors.log:"; tail -4 "$H/.cache/apogee/errors.log"; else echo "  ok    no panic"; fi
 pss=$(awk '/^Pss:/{print int($2/1024)}' /proc/$HPID/smaps_rollup 2>/dev/null)
 echo "  info  daemon memory ${pss:-?} MB (PSS, software rendering)"
 echo "== Sway without the patch? (commands only the patched Sway knows)"
-if grep -qaF "close button: cairo" "$(command -v "$SWAY")"; then echo "  info  patched Sway"; else echo "  info  plain Sway"; fi
+if [ "$PATCHED" = 1 ]; then echo "  info  patched Sway"; else echo "  info  plain Sway"; fi
 for c in "maximize toggle" "snap left" "minimize"; do
     out=$(swaymsg "$c" 2>&1)
     if [[ "$out" == *nknown* ]]; then echo "  info  '$c' is unknown to this Sway"; else echo "  info  '$c' is known"; fi
@@ -169,7 +206,7 @@ done
 kill "$HPID" 2>/dev/null; kill "$SWAYPID" 2>/dev/null; wait 2>/dev/null
 UVNITR
 # MERIT= is the older name of MEASURE_RUNS
-export T RT H OUT DAEMON SWAY MEASURE_RUNS=${MEASURE_RUNS:-${MERIT:-}}
+export T RT H OUT DAEMON SWAY PATCHED SRC MEASURE_RUNS=${MEASURE_RUNS:-${MERIT:-}}
 # services the bus starts by itself (portals, gvfs, dconf) also get only the test folders
 env -u WAYLAND_DISPLAY -u DISPLAY -u SWAYSOCK -u I3SOCK XDG_RUNTIME_DIR="$RT" HOME="$H" GTK_A11Y=none \
     dbus-run-session -- bash "$T/inside.sh" 2>/dev/null | tee "$T/result.txt"

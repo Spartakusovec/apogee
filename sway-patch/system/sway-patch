@@ -1,0 +1,123 @@
+#!/bin/bash
+# Fedora's Sway rebuilt with the window-actions patch (title bar buttons, maximize, edge snapping,
+# minimize) – part of Apogee.
+#
+# dnf runs it after every transaction that brought a new Sway
+# (/etc/dnf/libdnf5-plugins/actions.d/sway-patch.actions), and as a safety net shortly after boot
+# (sway-patch-check.timer – in case something other than dnf updated Sway).
+# If the installed Sway lacks the patch (or has an older version of it): downloads Fedora's Sway
+# source package, adds the patch, bumps the release (3 → 3.1, the next patch version 3.2…),
+# builds and installs it. Start and result are announced with a notification. What is installed
+# is remembered in /var/lib/sway-patch/state (Sway version + patch fingerprint).
+# Back to Fedora's Sway: first turn the automation off (see install.sh), otherwise it rebuilds
+# right after a downgrade.
+#
+# As root it builds only from things owned by root (the patch in /usr/local/share/sway-patch)
+# or signed (Fedora's package, Sway's source) – nothing from a home folder.
+# By hand: sudo /usr/local/libexec/sway-patch
+set -uo pipefail
+# the user to notify (written by install.sh)
+NOTIFY_USER=$(sed -n 's/^USER=//p' /etc/sway-patch.conf 2>/dev/null)
+PATCH=/usr/local/share/sway-patch/sway-window-actions.patch
+WORK=/var/cache/sway-patch
+MARKER="close button: cairo" # a string found only in the patched /usr/bin/sway
+STATE=/var/lib/sway-patch/state
+
+[ "$(id -u)" = 0 ] || { echo "Run as root: sudo $0" >&2; exit 1; }
+# one rebuild at a time (dnf and the boot check); the second waits and then finds the patch is there
+exec 9>/run/sway-patch.lock
+flock 9
+rpm -q sway >/dev/null 2>&1 || exit 0
+[ -f "$PATCH" ] || { echo "Patch $PATCH missing" >&2; exit 1; }
+PATCH_ID=$(sha256sum "$PATCH" | cut -c1-16)
+INSTALLED=$(rpm -q --qf '%{VERSION}-%{RELEASE}' sway)
+# this version already has the patch
+if grep -qaF "$MARKER" /usr/bin/sway && [ "$(cat "$STATE" 2>/dev/null)" = "$INSTALLED $PATCH_ID" ]; then
+	exit 0
+fi
+
+notify() { # title text
+	local uid
+	[ -n "$NOTIFY_USER" ] || return 0
+	uid=$(id -u "$NOTIFY_USER") || return 0
+	[ -S "/run/user/$uid/bus" ] || return 0
+	runuser -u "$NOTIFY_USER" -- env DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+		notify-send -a Sway "$1" "$2" || true
+}
+failed() {
+	echo "CHYBA: $1"
+	notify "Title bar buttons are missing for now" "$1 Sway itself keeps working (panel, dock, Settings too); only the title bar buttons, maximize, snapping and minimize are gone until the patch is updated. Details: $WORK/build.log"
+	exit 1
+}
+# the dnf that started us may hold its lock for a while
+dnf_retry() {
+	for _ in $(seq 30); do
+		dnf -y "$@" && return 0
+		sleep 20
+	done
+	return 1
+}
+
+rm -rf "$WORK"
+mkdir -p "$WORK/srpm"
+cd "$WORK" || exit 1
+exec > >(tee "$WORK/build.log") 2>&1
+
+# Fedora's Sway source (the installed one may already be ours, Fedora doesn't have that one)
+VR=$(dnf repoquery -q --available --latest-limit=1 --arch=x86_64 --qf '%{version}-%{release}\n' sway 2>/dev/null | tail -1)
+[ -n "$VR" ] || VR=$INSTALLED
+if grep -qaF "$MARKER" /usr/bin/sway; then
+	echo "Installed Sway $INSTALLED has an older version of the patch, rebuilding from Fedora $VR."
+	notify "Rebuilding Sway" "Updating the title bar buttons patch, this takes a few minutes."
+else
+	echo "Installed Sway $INSTALLED has no title bar buttons, rebuilding from Fedora $VR."
+	notify "Rebuilding Sway" "An update replaced Sway ($INSTALLED). Adding the title bar buttons back, this takes a few minutes."
+fi
+
+dnf_retry download --source --destdir "$WORK" "sway-$VR" || failed "Could not download the Sway $VR source package."
+(cd srpm && rpm2cpio "$WORK"/sway-*.src.rpm | cpio -idm --quiet) || failed "Could not unpack the source package."
+cp "$PATCH" srpm/ || failed "The patch $PATCH is missing."
+
+python3 - srpm/sway.spec "$INSTALLED" <<'EOF' || failed "The Fedora spec file changed, the patch has to be added by hand."
+import re, sys, time
+p, installed = sys.argv[1], sys.argv[2]
+s = open(p).read()
+ver = re.search(r"^Version:\s*(\S+)", s, re.M).group(1)
+m = re.search(r"^Release:\s*(\d+)%\{\?dist\}", s, re.M)
+if not m:
+    sys.exit("Release line not understood")
+# our builds have the release <Fedora>.<n>; a new one must be higher than the installed one
+n = 1
+k = re.match(rf"^{re.escape(ver)}-{m.group(1)}\.(\d+)\.", installed)
+if k:
+    n = int(k.group(1)) + 1
+s = re.sub(r"^(Release:\s*)(\d+)(%\{\?dist\})", lambda x: f"{x.group(1)}{x.group(2)}.{n}{x.group(3)}", s, count=1, flags=re.M)
+s, n = re.subn(r"^(Source\d+:.*\n)(?!Source)", r"\1Patch99:        sway-window-actions.patch\n", s, count=1, flags=re.M)
+if n != 1:
+    sys.exit("Source lines not found")
+# Fedora: “%autosetup -N” and patches up to 99 through “%autopatch -p1 -M99” (sometimes commented out)
+s = s.replace("#autopatch -p1 -M99", "%autopatch -p1 -M99", 1)
+if "%autopatch -p1 -M99" not in s and "%autosetup -N" in s:
+    sys.exit("%autopatch not found")
+rel = re.search(r"^Release:\s*(\S+?)%", s, re.M).group(1)
+s = s.replace("%changelog\n", f"%changelog\n* {time.strftime('%a %b %d %Y')} sway-patch <root@localhost> - {ver}-{rel}\n- Title bar buttons, maximize, snapping, minimize (window-actions patch)\n\n", 1)
+open(p, "w").write(s)
+EOF
+
+dnf_retry builddep srpm/sway.spec || failed "Could not install the build dependencies."
+rpmbuild -bb --define "_sourcedir $WORK/srpm" --define "_topdir $WORK/rpmbuild" srpm/sway.spec \
+	|| failed "The patch does not fit Sway $VR any more, it has to be updated by hand."
+
+packages=()
+for b in sway sway-config-upstream sway-config-fedora sway-config-minimal sway-wallpapers; do
+	rpm -q "$b" >/dev/null 2>&1 || continue
+	f=$(ls "$WORK"/rpmbuild/RPMS/*/"$b"-[0-9]*.rpm 2>/dev/null | head -1)
+	[ -n "$f" ] && packages+=("$f")
+done
+dnf_retry install "${packages[@]}" || failed "Could not install the rebuilt Sway."
+grep -qaF "$MARKER" /usr/bin/sway || failed "The installed Sway still has no title bar buttons."
+mkdir -p "$(dirname "$STATE")"
+echo "$(rpm -q --qf '%{VERSION}-%{RELEASE}' sway) $PATCH_ID" > "$STATE"
+
+echo "Done: $(rpm -q sway)"
+notify "Sway rebuilt with the title bar buttons" "Log out and back in to use it."

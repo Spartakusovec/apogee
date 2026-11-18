@@ -1,0 +1,3 @@
+# After a transaction that brought a new Sway, rebuild it with the window-actions patch in the
+# background. The script recognises an already patched Sway and does nothing then.
+post_transaction:sway:in:enabled=host-only:/usr/bin/systemd-run --no-block --quiet --unit=sway-patch --property=Nice=10 /usr/local/libexec/sway-patch
